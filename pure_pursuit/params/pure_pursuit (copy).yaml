@@ -1,0 +1,44 @@
+pure_pursuit:
+  ros__parameters:
+    # Topics
+    odom_topic: "/odom0"
+    drive_topic: "/ackermann_cmd0"
+    ttc_scan_topic: "/scan_front"
+
+    # Speed caps (직선 하드캡)
+    speed_min: 1.0
+    speed_max: 9.0          # 7.5~8.0부터 시작, 안정되면 8.5→9.0 단계 상승
+
+    # Vehicle / cornering (곡률 → 속도 제한 via ay)
+    wheelbase: 0.34
+    ay_max: 9.0             # 코너 상한. 미끄러지면 7.5→6.5로 낮추기
+
+    # Dynamic lookahead (속도 기반)
+    ld0: 1.2
+    kv_ld: 0.22
+    ld_min: 0.8
+    ld_max: 2.5             # 필요시 2.3~2.5로 살짝 ↑ (코너 유지력↑)
+
+    # TTC gating (위협일 때만 개입)
+    ttc_gate: 1.1
+    ttc_safe: 0.9
+    k_ttc: 6.0
+
+    # ★ TTC 필터(벽/옆면 오인 억제)
+    ttc_fov_deg: 12.0       # 정면 ±15°
+    ttc_corridor_half: 0.35 # 복도 반폭 0.40m (트랙 폭에 맞춰 0.35~0.45 튜닝)
+
+    # v_ref shaping (부드럽게 + 급감속 억제)
+    tau_v: 0.10
+    a_ref_up: 6.0
+    a_ref_down: 3.5
+    v_deadband: 0.15
+
+    # Longitudinal control (가속 P제어)
+    k_accel: 5.0
+    accel_max: 9.0
+    accel_min: -5.0
+
+    # ★ 코너 완화 노브(곡률 가중치)
+    curv_gain_speed: 0.80   # 1.0=기본, 0.85~0.80이면 코너 더 빠름
+

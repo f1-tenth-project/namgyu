@@ -1,0 +1,7 @@
+scan_crop_node:
+  ros__parameters:
+    in_topic: "/scan0"         # A: 전체 스캔
+    out_topic: "/scan_front"   # B: 전방만 슬라이스
+    fov_deg: 50.0              # ±25°
+    center_deg: 0.0
+
