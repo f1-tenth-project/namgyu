@@ -1,0 +1,39 @@
+pure_pursuit_node:
+  ros__parameters:
+    # === 기본 ===
+    lookahead: 1.0        # 저속 기본 Ld
+    wheelbase: 0.34
+
+    speed_min: 1.0
+    speed_max: 20.0       # 직선 최대속도 +1
+
+    k_accel: 2.0          # 감속/가속 P gain 완화
+    accel_min: -7.5       # 최대 감속 완화
+    accel_max: 3.1
+
+    # === 동적 룩어헤드 (속도 + 곡률) ===
+    kv_ld: 0.40
+    ld_min: 1.0
+    ld_max: 4.5
+    k_ld_curv: 3.0        # 곡률 기반 Ld 축소 강도 (조금 약하게)
+
+    # === 곡률 프리뷰 (조금 더 가깝게) ===
+    curv_preview_min: 1.5     # 2.0 → 1.5
+    curv_preview_max: 6.0     # 8.0 → 6.0
+    curv_preview_time: 0.25   # 0.35 → 0.25
+    curv_preview_step: 0.25
+
+    # === 곡률 기반 속도 제한 ===
+    ay_max: 5.1           # 허용 횡가속도 ↑
+    curv_gain_speed: 1.95  # 곡률 민감도 살짝 감소
+
+    # === 토픽/CSV ===
+    center_path_csv: "/home/kimtaemin/race/src/racecar_simulator/maps/lane_process/icra2025/icra2025_raceline.csv"
+    # center_path_csv: "/home/namgyu/race/src/racecar_simulator/maps/lane_process/icra2025/icra2025_raceline.csv"
+    center_path_topic: "center_path"
+    left_boundary: "left_boundary"
+    right_boundary: "right_boundary"
+    odom_topic: "odom0"
+    drive_topic: "ackermann_cmd0"
+
+    use_sim_time: false
