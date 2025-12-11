@@ -3,14 +3,14 @@
 ## Key Features
 
 1.  **Dynamic Pure Pursuit:**
-    * 차량의 속도와 경로의 곡률(Curvature)에 따라 `Lookahead Distance`를 동적으로 조절합니다.
+    * 차량의 속도와 경로의 곡률(Curvature)에 따라 `Lookahead Distance`를 동적으로 조절
 2.  **Physics-based Speed Control:**
-    * 경로의 곡률을 미리 분석하여(Preview), 횡방향 가속도($a_y$) 한계 내에서 **최대 진입 속도**를 계산합니다.
+    * 경로의 곡률을 미리 분석하여(Preview), 횡방향 가속도($a_y$) 한계 내에서 **최대 진입 속도**를 계산
 3.  **Robust Obstacle Detection:**
-    * **RANSAC Algorithm:** LiDAR 데이터에서 트랙 벽(Wall)을 직선으로 추정하여 제거합니다.
-    * **Clustering:** 벽이 제거된 데이터에서 장애물(Obstacle) 군집만을 정확히 추출합니다.
+    * **RANSAC Algorithm:** LiDAR 데이터에서 트랙 벽(Wall)을 직선으로 추정하여 제거
+    * **Clustering:** 벽이 제거된 데이터에서 장애물(Obstacle) 군집만을 정확히 추출
 4.  **Active Avoidance (FTG + PID):**
-    * 장애물이 감지되면 경로 추종 조향각에 FTG 기반의 회피 조향각을 PID로 합성하여 부드럽게 회피합니다.
+    * 장애물이 감지되면 경로 추종 조향각에 FTG 기반의 회피 조향각을 PID로 합성하여 부드럽게 회피
 
 ---
 
@@ -29,7 +29,7 @@
 
 ## Parameters Guide
 
-이 노드는 정밀한 튜닝을 위해 다양한 파라미터를 제공합니다. `config/pure_pursuit.yaml`에서 수정 가능합니다.
+정밀한 튜닝을 위해 다양한 파라미터를 제공며 `config/pure_pursuit.yaml`에서 수정 가능
 
 ### 1. Driving Performance (주행 성능)
 | Parameter | Default | Description |
