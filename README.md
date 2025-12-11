@@ -29,7 +29,7 @@
 
 ## Parameters Guide
 
-정밀한 튜닝을 위해 다양한 파라미터를 제공며 `config/pure_pursuit.yaml`에서 수정 가능
+정밀한 튜닝을 위해 다양한 파라미터를 제공하며 `config/pure_pursuit.yaml`에서 수정 가능
 
 ### 1. Driving Performance (주행 성능)
 | Parameter | Default | Description |
@@ -55,7 +55,7 @@
 | `steer_lpf_alpha` | **0.6** | 조향값 스무딩 필터 계수 (0.0~1.0, 클수록 최신값 반영) |
 
 ---
-
+(old version)
 ## Modified Files
 주요 수정 파일 위치
 
