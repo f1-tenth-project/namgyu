@@ -1,141 +1,119 @@
-// pure_pursuit_node.cpp
+// pure_pursuit.cpp
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <ackermann_msgs/msg/ackermann_drive_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/point.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
+#include <visualization_msgs/msg/marker.hpp>
 
-#include <algorithm>
-#include <cmath>
-#include <chrono>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
-#include <limits>
-#include <random>
-#include <numeric>
-
-#include <std_msgs/msg/bool.hpp>
-#include <std_msgs/msg/float32.hpp>
-#include <visualization_msgs/msg/marker_array.hpp>
-#include <visualization_msgs/msg/marker.hpp>          // ★ 추가
-#include <geometry_msgs/msg/point.hpp>
-#include <sstream>
-#include <iomanip>
+#include <algorithm>
+#include <cmath>
+#include <random>   // 벽 RANSAC용 난수
+#include <limits>   // numeric_limits
+#include <chrono>   // timer duration
 
 class PurePursuitNode : public rclcpp::Node {
 public:
   PurePursuitNode() : Node("pure_pursuit_node") {
-    // ----- 기본 PP / 토픽 파라미터 -----
-    lookahead_ = declare_parameter<double>("lookahead", 1.5);           // (동적 Ld가 대신 사용됨)
-    wheelbase_ = declare_parameter<double>("wheelbase", 0.34);
-    v_min_     = declare_parameter<double>("speed_min", 1.0);
-    v_max_     = declare_parameter<double>("speed_max", 9.0);           // 직선 하드캡
-    k_speed_   = declare_parameter<double>("k_speed",  2.5);            // (옵션)
-    k_accel_   = declare_parameter<double>("k_accel",  4.0);            // 속도 P 이득
-    a_min_     = declare_parameter<double>("accel_min",-5.0);
-    a_max_     = declare_parameter<double>("accel_max", 8.0);
+    // ----- 기본 파라미터 -----
+    lookahead_ = declare_parameter<double>("lookahead", 0.8);     // [m] 기본 Ld (저속 Ld)
+    wheelbase_ = declare_parameter<double>("wheelbase", 0.34);    // [m]
+    v_min_     = declare_parameter<double>("speed_min", 1.0);     // [m/s]
+    v_max_     = declare_parameter<double>("speed_max", 20.0);    // [m/s]
+    k_accel_   = declare_parameter<double>("k_accel",  2.5);      // P gain for (v_ref - v)
+    a_min_     = declare_parameter<double>("accel_min",-9.0);     // [m/s^2]
+    a_max_     = declare_parameter<double>("accel_max",  4.0);    // [m/s^2]
+
+    // ----- 동적 룩어헤드 파라미터 -----
+    kv_ld_      = declare_parameter<double>("kv_ld",   0.3);      // 속도 비례 계수
+    ld_min_     = declare_parameter<double>("ld_min",  0.6);      // 최소 Ld
+    ld_max_     = declare_parameter<double>("ld_max",  4.0);      // 최대 Ld
+    k_ld_curv_  = declare_parameter<double>("k_ld_curv", 4.0);    // 곡률 기반 Ld 축소 강도
+
+    // ----- 동적 곡률 프리뷰 파라미터 -----
+    curv_preview_t_    = declare_parameter<double>("curv_preview_time", 0.8);  // [s]
+    curv_preview_min_  = declare_parameter<double>("curv_preview_min",  3.0);  // [m]
+    curv_preview_max_  = declare_parameter<double>("curv_preview_max",  9.0);  // [m]
+    curv_preview_step_ = declare_parameter<double>("curv_preview_step", 0.3);  // [m]
+
+    // 곡률 기반 속도 제한용 파라미터
+    ay_max_          = declare_parameter<double>("ay_max",          3.0);  // [m/s^2]
+    curv_gain_speed_ = declare_parameter<double>("curv_gain_speed", 1.5);  // 곡률 민감도
+
+    // ----- 경로/토픽 파라미터 -----
     center_path_topic_ = declare_parameter<std::string>("center_path_topic", "center_path");
-    left_path_topic_   = declare_parameter<std::string>("left_boundary",  "left_boundary");
-    right_path_topic_  = declare_parameter<std::string>("right_boundary", "right_boundary");
-    odom_topic_        = declare_parameter<std::string>("odom_topic",     "odom0");
-    drive_topic_       = declare_parameter<std::string>("drive_topic",    "ackermann_cmd0");
+    left_path_topic_   = declare_parameter<std::string>("left_boundary",   "left_boundary");
+    right_path_topic_  = declare_parameter<std::string>("right_boundary",  "right_boundary");
+    odom_topic_        = declare_parameter<std::string>("odom_topic",      "odom0");
+    drive_topic_       = declare_parameter<std::string>("drive_topic",     "ackermann_cmd0");
 
-    // ----- 고도화 파라미터: Ld/곡률속도/TTC -----
-    ay_max_        = declare_parameter<double>("ay_max",   6.0);         // 횡가속 제한
-    ld0_           = declare_parameter<double>("ld0",      1.2);
-    kv_ld_         = declare_parameter<double>("kv_ld",    0.22);
-    ld_min_        = declare_parameter<double>("ld_min",   0.8);
-    ld_max_        = declare_parameter<double>("ld_max",   2.0);
+    // raceline CSV 경로
+    center_path_csv_ = declare_parameter<std::string>(
+        "center_path_csv",
+        "/home/namgyu/race/src/racecar_simulator/maps/lane_process/icra2025/icra2025_raceline.csv"
+    );
 
-    ttc_safe_      = declare_parameter<double>("ttc_safe", 0.9);
-    k_ttc_         = declare_parameter<double>("k_ttc",    8.0);
-    ttc_gate_      = declare_parameter<double>("ttc_gate", 1.1);
-    ttc_scan_topic_= declare_parameter<std::string>("ttc_scan_topic", "scan0");
+    // ----- LiDAR / 군집 기반 장애물 인식 파라미터 -----
+    scan_topic_      = declare_parameter<std::string>("scan_topic",      "scan0");
+    scan_frame_id_   = declare_parameter<std::string>("scan_frame_id",   "base_link0");
 
-    tau_v_         = declare_parameter<double>("tau_v",    0.10);        // v_ref LPF
+    obs_fov_deg_        = declare_parameter<double>("obs_fov_deg",        60.0); // 정면 ±60도
+    obs_corridor_half_  = declare_parameter<double>("obs_corridor_half",  0.6);  // 복도 반폭 [m]
+    obs_x_min_          = declare_parameter<double>("obs_x_min",          0.3);  // 차 바로 앞은 제외
+    obs_max_range_      = declare_parameter<double>("obs_max_range",      8.0);  // 최대 사용 거리
+    obs_cluster_dist_   = declare_parameter<double>("obs_cluster_dist",   0.35); // 군집 내부 점 간 거리 임계
+    obs_min_points_     = declare_parameter<int>("obs_min_points",        3);    // 최소 포인트 수
+    obs_front_y_thresh_ = declare_parameter<double>("obs_front_y_thresh", 0.4);  // 정면 범위 |cy| <= 이 값
 
-    // ----- v_ref 안정화(래이트 제한/데드밴드) -----
-    a_ref_up_      = declare_parameter<double>("a_ref_up",   6.0);       // v_ref 상승 한계 [m/s^2]
-    a_ref_down_    = declare_parameter<double>("a_ref_down", 3.5);       // v_ref 하강 한계 [m/s^2]
-    v_deadband_    = declare_parameter<double>("v_deadband", 0.15);      // |v_ref - v| < dead → 0 처리
+    // ----- 벽 RANSAC 파라미터 -----
+    wall_inlier_thresh_      = declare_parameter<double>("wall_inlier_thresh", 0.07);  // [m]
+    wall_ransac_iters_       = declare_parameter<int>("wall_ransac_iters", 80);
+    wall_ransac_min_inliers_ = declare_parameter<int>("wall_ransac_min_inliers", 20);
 
-    // ★ TTC 필터 파라미터(정면 시야/복도폭)
-    ttc_fov_deg_       = declare_parameter<double>("ttc_fov_deg", 20.0);     // 정면 각도창 ±deg
-    ttc_corridor_half_ = declare_parameter<double>("ttc_corridor_half", 0.45); // 복도 반폭[m]
+    // ----- 트랙 기반 장애물 필터 파라미터 -----
+    track_wall_margin_     = declare_parameter<double>("track_wall_margin", 0.4);
+    track_center_max_dist_ = declare_parameter<double>("track_center_max_dist", 1.2);
 
-    // ★ 코너 완화 노브(곡률 가중치)
-    curv_gain_speed_ = declare_parameter<double>("curv_gain_speed", 1.0);
+    // ----- 장애물 감속 파라미터 -----
+    obstacle_slow_dist_ = declare_parameter<double>("obstacle_slow_dist", 5.0);
+    obstacle_stop_dist_ = declare_parameter<double>("obstacle_stop_dist", 2.0);
+    obstacle_v_min_     = declare_parameter<double>("obstacle_v_min",     0.5);
 
-    // ---------- 코너 인식 파라미터 ----------
-    corner_enable_         = declare_parameter<bool>("corner_enable", true);
-    corner_side_deg_       = declare_parameter<double>("corner_side_deg", .60);
-    ransac_iters_          = declare_parameter<int>("corner_ransac_iters", 250);
-    ransac_tol_            = declare_parameter<double>("corner_ransac_tol", 0.10);  // 완화
-    min_inliers_           = declare_parameter<int>("corner_min_inliers", 8);      // 완화
-    angle_thresh_deg_      = declare_parameter<double>("corner_angle_thresh_deg", 10.0);
-    intersect_max_dist_    = declare_parameter<double>("corner_intersect_max", 10.0);
-    circle_use_            = declare_parameter<bool>("corner_circle_use", false); // 현재 미사용
-    circle_R_max_          = declare_parameter<double>("corner_circle_Rmax", 6.0);
-    ema_alpha_             = declare_parameter<double>("corner_ema_alpha", 0.35);
-    corner_on_cycles_      = declare_parameter<int>("corner_on_cycles", 3);
-    corner_off_cycles_     = declare_parameter<int>("corner_off_cycles", 10);
+    // ----- 회피용 PID & 스무딩 파라미터 -----
+    k_p_avoid_ = declare_parameter<double>("k_p_avoid", 0.8);
+    k_i_avoid_ = declare_parameter<double>("k_i_avoid", 0.0);
+    k_d_avoid_ = declare_parameter<double>("k_d_avoid", 0.1);
 
-    // 전역 탐색 보조 파라미터
-    corner_y_max_          = declare_parameter<double>("corner_y_max", 3.5);
-    corner_merge_radius_   = declare_parameter<double>("corner_merge_radius", 0.35);
-    corner_max_lines_      = declare_parameter<int>("corner_max_lines", 8);
+    steering_lpf_alpha_ = declare_parameter<double>("steer_lpf_alpha", 0.6); // 0.3~0.7
+    max_steer_rate_     = declare_parameter<double>("max_steer_rate", 2.0);  // [rad/s]
+    steer_ftg_max_      = declare_parameter<double>("steer_ftg_max", 0.7);   // FTG 최대 조향 [rad]
 
-    // ★ 단일벽 폐색 에지 기반 코너 추정 파라미터
-    occl_fov_deg_          = declare_parameter<double>("corner_occl_fov_deg", 80.0); // 정면 ±80°
-    occl_jump_abs_         = declare_parameter<double>("corner_occl_jump_abs", 0.4); // Δr 절대 임계
-    occl_jump_ratio_       = declare_parameter<double>("corner_occl_jump_ratio", 1.25); // r_{i+1}/r_i
-
-    // 디버그
-    debug_markers_ = declare_parameter<bool>("corner_debug_markers", true);
-    debug_frame_   = declare_parameter<std::string>("corner_debug_frame", "base_link");
-
-    // ★ 인코스 바이어스 파라미터 ------------------------------
-    inner_bias_enable_       = declare_parameter<bool>("inner_bias_enable", true);
-    inner_bias_kappa_thresh_ = declare_parameter<double>("inner_bias_kappa_thresh", 0.04);
-    inner_bias_offset_max_   = declare_parameter<double>("inner_bias_offset_max", 0.35);
-    inner_bias_gain_         = declare_parameter<double>("inner_bias_gain", 1.5);
-    // --------------------------------------------------------
-
-    // ★ 군집 기반 장애물 인식 파라미터 -------------------------
-    obs_enable_           = declare_parameter<bool>("obs_enable", true);
-    obs_fov_deg_          = declare_parameter<double>("obs_fov_deg", 60.0);   // 정면 ±60도
-    obs_corridor_half_    = declare_parameter<double>("obs_corridor_half", 0.6); // 사용 복도 반폭
-    obs_x_min_            = declare_parameter<double>("obs_x_min", 0.3);      // 차량 앞 최소 x
-    obs_max_range_        = declare_parameter<double>("obs_max_range", 8.0);  // 최대 사용 거리
-    obs_cluster_dist_     = declare_parameter<double>("obs_cluster_dist", 0.35); // 클러스터 거리 기준
-    obs_min_points_       = declare_parameter<int>("obs_min_points", 3);         // 최소 포인트 수
-    obs_front_y_thresh_   = declare_parameter<double>("obs_front_y_thresh", 0.35); // 정면 장애물 y 범위
-      // ★ FTG (Follow-The-Gap) 파라미터 -------------------------
-    ftg_enable_           = declare_parameter<bool>("ftg_enable", true);
-    ftg_fov_deg_          = declare_parameter<double>("ftg_fov_deg", 90.0);    // FTG 검색 시야 ±deg
-    ftg_block_margin_deg_ = declare_parameter<double>("ftg_block_margin_deg", 5.0); // 클러스터 각도 여유
-    ftg_min_gap_deg_      = declare_parameter<double>("ftg_min_gap_deg", 10.0);     // 사용 가능한 최소 gap
-    ftg_force_dist_       = declare_parameter<double>("ftg_force_dist", 1.5);       // 이 거리 이내에서만 FTG 개입
-    // --------------------------------------------------------
-    
-    // --------------------------------------------------------
-
-    // ----- Pub/Sub -----
-    drive_pub_ = create_publisher<ackermann_msgs::msg::AckermannDriveStamped>(
-        drive_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
+    // ----- Publisher / Subscriber -----
+    drive_pub_ = create_publisher<ackermann_msgs::msg::AckermannDriveStamped>(drive_topic_, 10);
+    raceline_pub_ = create_publisher<nav_msgs::msg::Path>("raceline_path", 10);
+    lookahead_pub_ = create_publisher<visualization_msgs::msg::Marker>("lookahead_marker", 10);
+    curvature_pub_ = create_publisher<visualization_msgs::msg::Marker>("curvature_points", 10);
+    obstacle_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("obstacle_clusters", 10);
+    wall_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("pp_debug/walls", 10);
 
     sub_center_ = create_subscription<nav_msgs::msg::Path>(
-        center_path_topic_, rclcpp::QoS(1).reliable(),
-        [this](nav_msgs::msg::Path::SharedPtr msg){ center_path_ = *msg; });
+        center_path_topic_, 1,
+        [this](nav_msgs::msg::Path::SharedPtr msg){ center_path_from_topic_ = *msg; });
 
     sub_left_ = create_subscription<nav_msgs::msg::Path>(
-        left_path_topic_, rclcpp::QoS(1).reliable(),
+        left_path_topic_, 1,
         [this](nav_msgs::msg::Path::SharedPtr msg){ left_path_ = *msg; });
 
     sub_right_ = create_subscription<nav_msgs::msg::Path>(
-        right_path_topic_, rclcpp::QoS(1).reliable(),
+        right_path_topic_, 1,
         [this](nav_msgs::msg::Path::SharedPtr msg){ right_path_ = *msg; });
 
     sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -144,490 +122,322 @@ public:
           odom_ = *msg; has_odom_ = true;
         });
 
-    sub_ttc_scan_ = create_subscription<sensor_msgs::msg::LaserScan>(
-        ttc_scan_topic_, rclcpp::SensorDataQoS(),
+    // LiDAR 스캔 구독 → 군집 + 벽 인식 + FTG 타겟
+    sub_scan_ = create_subscription<sensor_msgs::msg::LaserScan>(
+        scan_topic_, rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::LaserScan::SharedPtr msg){
-          last_ttc_scan_ = *msg; has_ttc_scan_ = true;
+          detectObstacleClusters(*msg);
         });
 
-    pub_corner_active_ = create_publisher<std_msgs::msg::Bool>("/pp_debug/corner_active", 10);
-    pub_corner_conf_   = create_publisher<std_msgs::msg::Float32>("/pp_debug/corner_conf", 10);
-    pub_ttc_min_       = create_publisher<std_msgs::msg::Float32>("/pp_debug/ttc_min", 10);
-    pub_markers_       = create_publisher<visualization_msgs::msg::MarkerArray>("/pp_debug/markers", 10);
+    // ----- CSV 에서 raceline 로드 -----
+    loadCenterPathFromCsv(center_path_csv_);
 
-    // 장애물 인식 디버그
-    pub_obs_front_   = create_publisher<std_msgs::msg::Bool>("/pp_debug/obs_front", 10);
-    pub_obs_dist_    = create_publisher<std_msgs::msg::Float32>("/pp_debug/obs_dist", 10);
-    pub_obs_markers_ = create_publisher<visualization_msgs::msg::MarkerArray>("/pp_debug/obs_markers", 10);
+    // 주행 타이머 (10ms)
+    timer_ = create_wall_timer(
+        std::chrono::milliseconds(10),
+        std::bind(&PurePursuitNode::onTimer, this));
 
-    // ★ 단일 장애물 마커 퍼블리셔 (정면 장애물 하나 표시용)
-    pub_obs_single_marker_ =
-        create_publisher<visualization_msgs::msg::Marker>("/pp_debug/obs_front_marker", 10);
-
-    // 메인 제어 타이머
-    timer_ = create_wall_timer(std::chrono::milliseconds(10),
-                               std::bind(&PurePursuitNode::onTimer, this));
-
-    // ★ 장애물 마커 업데이트용 별도 타이머 (기존 함수 수정 X)
-    obs_marker_timer_ = create_wall_timer(
-        std::chrono::milliseconds(50),
-        std::bind(&PurePursuitNode::onObsMarkerTimer, this));
+    // RANSAC 난수 시드
+    rng_.seed(12345);
   }
 
 private:
-  // ---------- 상수/유틸 ----------
-  static constexpr double kPI() { return 3.14159265358979323846; }
-  static inline double dot(double ax,double ay,double bx,double by){ return ax*bx+ay*by; }
+  // ======================= CSV 로 경로 로드 =======================
+  void loadCenterPathFromCsv(const std::string &csv_path) {
+    center_path_.poses.clear();
+    center_path_.header.frame_id = "map";
 
-  struct Pt { double x,y; };
-  struct Line { double a,b,c; }; // ax+by+c=0 (정규화)
+    std::ifstream ifs(csv_path);
+    if (!ifs.is_open()) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "Failed to open center_path csv: %s", csv_path.c_str());
+      return;
+    }
 
-  struct RansacLine {
-    Line L;
-    std::vector<Pt> inliers;
-  };
-  struct Corner {
-    Pt p;
-    double ang_deg;
-    double conf;
-    int i, j;   // 라인 인덱스
-  };
+    std::string line;
+    if (!std::getline(ifs, line)) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "center_path csv is empty: %s", csv_path.c_str());
+      return;
+    }
 
-  // 장애물 클러스터
+    int count = 0;
+    while (std::getline(ifs, line)) {
+      if (line.empty()) continue;
+      std::stringstream ss(line);
+      std::string sx, sy;
+      if (!std::getline(ss, sx, ',')) continue;
+      if (!std::getline(ss, sy, ',')) continue;
+
+      try {
+        double x = std::stod(sx);
+        double y = std::stod(sy);
+
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header.frame_id = "map";
+        ps.pose.position.x = x;
+        ps.pose.position.y = y;
+        ps.pose.position.z = 0.0;
+
+        center_path_.poses.push_back(ps);
+        ++count;
+      } catch (...) {
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to parse line in center_path csv: '%s'", line.c_str());
+      }
+    }
+
+    RCLCPP_INFO(this->get_logger(),
+                "Loaded center_path (raceline) from csv: %s (points=%d)",
+                csv_path.c_str(), count);
+  }
+
+  // ======================= 메인 주행 루프 =======================
+  void onTimer() {
+    if (!has_odom_ || center_path_.poses.empty()) return;
+
+    center_path_.header.frame_id = "map";
+    center_path_.header.stamp = now();
+    raceline_pub_->publish(center_path_);
+
+    // ----- 현재 자세 -----
+    const auto &p = odom_.pose.pose.position;
+    const auto &q = odom_.pose.pose.orientation;
+    double roll, pitch, yaw;
+    tf2::Quaternion tq(q.x, q.y, q.z, q.w);
+    tf2::Matrix3x3(tq).getRPY(roll, pitch, yaw);
+    const double x = p.x, y = p.y;
+
+    // 현재 속도
+    const double v = odom_.twist.twist.linear.x;
+
+    // ----- 동적 곡률 프리뷰 -----
+    double L_curv = curv_preview_min_ + curv_preview_t_ * std::max(0.0, v);
+    L_curv = std::clamp(L_curv, curv_preview_min_, curv_preview_max_);
+
+    std::vector<geometry_msgs::msg::Point> preview_points;
+    double kappa_ahead = computeMaxCurvatureAhead(center_path_, x, y,
+                                                  L_curv, curv_preview_step_,
+                                                  preview_points);
+    publishCurvaturePointsMarker(preview_points);
+
+    // ----- 동적 룩어헤드 -----
+    double Ld_base = lookahead_ + kv_ld_ * std::max(0.0, v);
+    double kappa_abs = std::abs(kappa_ahead);
+    double curv_factor = 1.0 / (1.0 + k_ld_curv_ * kappa_abs);
+    curv_factor = std::max(curv_factor, 0.3);   // 최소 0.3배
+    double Ld = std::clamp(Ld_base * curv_factor, ld_min_, ld_max_);
+
+    int target_idx = findLookaheadIndex(center_path_, x, y, Ld);
+    if (target_idx < 0) return;
+    const auto &tp = center_path_.poses[target_idx].pose.position;
+
+    const double dx = tp.x - x;
+    const double dy = tp.y - y;
+    const double xL =  std::cos(yaw) * dx + std::sin(yaw) * dy;
+    const double yL = -std::sin(yaw) * dx + std::cos(yaw) * dy;
+    if (xL <= 0.01) return;
+
+    const double curvature_pp = 2.0 * yL / (Ld * Ld);
+    double steer_pp = std::atan(wheelbase_ * curvature_pp);
+
+    publishLookaheadMarker(tp);
+
+    // ----- 곡률 기반 속도 상한 -----
+    double kappa_eff = std::max(1e-6, curv_gain_speed_ * std::abs(kappa_ahead));
+    double v_curv = std::sqrt(ay_max_ / kappa_eff);
+    double v_ref  = std::clamp(v_curv, v_min_, v_max_);
+
+    // ----- 장애물 거리 LPF -----
+    double d_obs = nearest_obstacle_dist_;
+    double alpha_d = 0.5; // 0.3~0.7 사이에서 튜닝
+    if (std::isfinite(d_obs)) {
+      if (!std::isfinite(nearest_obstacle_dist_filt_)) {
+        nearest_obstacle_dist_filt_ = d_obs;
+      } else {
+        nearest_obstacle_dist_filt_ =
+            alpha_d * d_obs + (1.0 - alpha_d) * nearest_obstacle_dist_filt_;
+      }
+    } else {
+      nearest_obstacle_dist_filt_ = std::numeric_limits<double>::infinity();
+    }
+    d_obs = nearest_obstacle_dist_filt_;
+
+    // ===== 장애물 기반 감속 (곡선형, LPF 거리 사용 + 히스테리시스 플래그 사용) =====
+    if (has_obstacle_stable_ && d_obs < obstacle_slow_dist_) {
+      double d = d_obs;
+      double v_lim = v_ref;
+
+      if (d <= obstacle_stop_dist_) {
+        v_lim = obstacle_v_min_;
+      } else {
+        double s = (d - obstacle_stop_dist_) /
+                   (obstacle_slow_dist_ - obstacle_stop_dist_);
+        s = std::clamp(s, 0.0, 1.0);
+        double w = s * s; // 멀수록 1, 가까울수록 0로 급하게
+        v_lim = obstacle_v_min_ + w * (v_ref - obstacle_v_min_);
+      }
+      v_ref = std::min(v_ref, v_lim);
+    }
+
+    // ----- v_ref LPF (속도 목표도 부드럽게) -----
+    double v_ref_raw = v_ref;
+    double alpha_v = 0.3; // 0.2~0.5 정도
+    if (!v_ref_init_) {
+      v_ref_filt_ = v_ref_raw;
+      v_ref_init_ = true;
+    } else {
+      v_ref_filt_ = alpha_v * v_ref_raw + (1.0 - alpha_v) * v_ref_filt_;
+    }
+
+    // ===== FTG + PID + 스무딩 조향 =====
+    const double dt = 0.01; // 타이머 10ms
+
+    double steer_cmd = steer_pp;
+
+    // 장애물 거리 기반 FTG 가중치 (LPF 거리 & 히스테리시스 사용)
+    double w_ftg = 0.0;
+    if (has_obstacle_stable_ && has_ftg_target_) {
+      double d = d_obs;
+      if (d <= obstacle_stop_dist_) {
+        w_ftg = 1.0;
+      } else if (d >= obstacle_slow_dist_) {
+        w_ftg = 0.0;
+      } else {
+        double s = (obstacle_slow_dist_ - d) /
+                   (obstacle_slow_dist_ - obstacle_stop_dist_);
+        s = std::clamp(s, 0.0, 1.0);
+        // ★ 더 빨리 FTG 비중이 올라가도록 s^2 대신 s 사용
+        w_ftg = s;
+      }
+    }
+
+    if (w_ftg > 1e-3) {
+      double e = steer_ftg_ - steer_pp;
+
+      avoid_err_int_ += e * dt;
+      double i_max = 0.3;
+      avoid_err_int_ = std::clamp(avoid_err_int_, -i_max, i_max);
+
+      double de = (e - avoid_err_prev_) / dt;
+      avoid_err_prev_ = e;
+
+      double delta = k_p_avoid_ * e + k_i_avoid_ * avoid_err_int_ + k_d_avoid_ * de;
+
+      steer_cmd = steer_pp + w_ftg * delta;
+    } else {
+      avoid_err_int_  = 0.0;
+      avoid_err_prev_ = 0.0;
+      steer_cmd = steer_pp;
+    }
+
+    // ----- 조향 변화율 제한 (장애물 가까우면 완화) -----
+    double max_rate = max_steer_rate_;
+    if (has_obstacle_stable_ && has_ftg_target_ && d_obs < obstacle_slow_dist_) {
+      // 장애물에 가까울수록 더 빨리 틀 수 있게 최대 조향 속도를 1~3배로 스케일
+      double g = (obstacle_slow_dist_ - d_obs) /
+                 (std::max(1e-3, obstacle_slow_dist_ - obstacle_stop_dist_));
+      g = std::clamp(g, 0.0, 1.0);
+      max_rate = max_steer_rate_ * (1.0 + 2.0 * g);  // max 3배
+    }
+
+    double max_delta = max_rate * dt;
+    double delta_raw = steer_cmd - steer_prev_;
+    delta_raw = std::clamp(delta_raw, -max_delta, max_delta);
+    double steer_step = steer_prev_ + delta_raw;
+
+    // 1차 LPF
+    double steer_final = steering_lpf_alpha_ * steer_step
+                       + (1.0 - steering_lpf_alpha_) * steer_prev_;
+    steer_prev_ = steer_final;
+
+    // ----- 가속도 명령 -----
+    double a_cmd = k_accel_ * (v_ref_filt_ - v); // 필터된 v_ref 사용
+    a_cmd = std::clamp(a_cmd, a_min_, a_max_);
+
+    ackermann_msgs::msg::AckermannDriveStamped cmd;
+    cmd.header.stamp = now();
+    cmd.header.frame_id = "base_link";
+    cmd.drive.steering_angle = steer_final;
+    cmd.drive.acceleration   = a_cmd;
+
+    drive_pub_->publish(cmd);
+  }
+
+  // ======================= 장애물 군집 + 벽 인식 =======================
   struct ObstacleCluster {
-    std::vector<Pt> pts;
+    std::vector<geometry_msgs::msg::Point> pts;
     double cx{0.0};
     double cy{0.0};
     double r_min{1e9};
   };
 
-  static Line makeLine(const Pt& p1, const Pt& p2){
-    const double dx = p2.x - p1.x, dy = p2.y - p1.y;
-    double a = dy, b = -dx, c = -(a*p1.x + b*p1.y);
-    const double n = std::sqrt(a*a+b*b);
-    if (n < 1e-9) return {0,1,0};
-    a/=n; b/=n; c/=n;
-    return {a,b,c};
-  }
-  static double lineDist(const Line& L, const Pt& p){ return std::abs(L.a*p.x + L.b*p.y + L.c); }
-  static bool lineIntersect(const Line& L1, const Line& L2, Pt& out){
-    const double det = L1.a*L2.b - L2.a*L1.b;
-    if (std::abs(det) < 1e-9) return false;
-    out.x = (L2.b*(-L1.c) - L1.b*(-L2.c)) / det;
-    out.y = (L1.a*(-L2.c) - L2.a*(-L1.c)) / det;
-    return true;
-  }
-  static double lineAngleDeg(const Line& L1, const Line& L2){
-    const double ux=-L1.b, uy=L1.a, vx=-L2.b, vy=L2.a;
-    const double c = std::clamp( dot(ux,uy,vx,vy)/(std::hypot(ux,uy)*std::hypot(vx,vy)), -1.0, 1.0);
-    return std::abs( std::acos(c) * 180.0 / kPI() );
-  }
+  struct Point2D {
+    double x;
+    double y;
+  };
 
-  static double computeMinTTC(const sensor_msgs::msg::LaserScan& s,
-                              double v, double fov_rad, double corridor_half)
+  struct LineModel {
+    double a{0.0}, b{0.0}, c{0.0}; // ax + by + c = 0
+    bool valid{false};
+  };
+
+  void detectObstacleClusters(const sensor_msgs::msg::LaserScan &scan)
   {
-    if (v < 0.05) return 1e9;
-    double ang = s.angle_min, min_ttc = 1e9;
-    for (size_t i=0;i<s.ranges.size(); ++i, ang += s.angle_increment){
-      const float r = s.ranges[i];
-      if (!std::isfinite(r)) continue;
+    clusters_.clear();
+
+    const double fov_rad = obs_fov_deg_ * M_PI / 180.0;
+    const double y_half  = obs_corridor_half_;
+    const double x_min   = obs_x_min_;
+    const double max_r   = obs_max_range_;
+    const double th_dist = obs_cluster_dist_;
+    const int    min_pts = std::max(1, obs_min_points_);
+
+    // ---------- 1) 벽 후보 점 수집 ----------
+    std::vector<Point2D> left_wall_pts;
+    std::vector<Point2D> right_wall_pts;
+    left_wall_pts.reserve(scan.ranges.size() / 2);
+    right_wall_pts.reserve(scan.ranges.size() / 2);
+
+    double ang = scan.angle_min;
+    for (size_t i=0; i<scan.ranges.size(); ++i, ang += scan.angle_increment) {
+      float r = scan.ranges[i];
+      if (!std::isfinite(r) || r <= 0.05f) continue;
+      if (r > (float)max_r) r = (float)max_r;
       if (std::abs(ang) > fov_rad) continue;
-      const double y = r * std::sin(ang);
-      if (std::abs(y) > corridor_half) continue;
-      const double v_rel = v * std::cos(ang);
-      if (v_rel <= 0) continue;
-      const double ttc = r / std::max(1e-3, v_rel);
-      if (ttc < min_ttc) min_ttc = ttc;
-    }
-    return min_ttc;
-  }
 
-  // ROI 완화: 더 멀리/넓게 보도록
-  void collectGlobalPoints(const sensor_msgs::msg::LaserScan& s,
-                           std::vector<Pt>& pts) const
-  {
-    pts.clear();
-    pts.reserve(s.ranges.size());
-    const double xmax = std::max(intersect_max_dist_ * 1.5, intersect_max_dist_);
-    double ang = s.angle_min;
-    for (size_t i=0;i<s.ranges.size(); ++i, ang += s.angle_increment){
-      const float r = s.ranges[i];
-      if (!std::isfinite(r) || r <= 0.05) continue;
-      Pt p{ r*std::cos(ang), r*std::sin(ang) };
-      if (p.x < 0.05 || p.x > xmax) continue;
-      if (std::abs(p.y) > std::max(corner_y_max_, 2.5)) continue;
-      pts.push_back(p);
-    }
-  }
+      double x = r * std::cos(ang);
+      double y = r * std::sin(ang);
+      if (x < x_min) continue;
 
-  static bool ransacLine(const std::vector<Pt>& pts, int iters, double tol,
-                         Line& best, std::vector<int>& inliers_idx)
-  {
-    if ((int)pts.size() < 2) return false;
-    std::mt19937 rng(1234567);
-    std::uniform_int_distribution<int> uni(0, (int)pts.size()-1);
-    size_t best_cnt = 0;
-    for (int it=0; it<iters; ++it){
-      int i=uni(rng), j=uni(rng);
-      if (i==j) continue;
-      Line L = makeLine(pts[i], pts[j]);
-      size_t cnt = 0;
-      for (size_t k=0;k<pts.size();++k) if (lineDist(L, pts[k]) < tol) ++cnt;
-      if (cnt > best_cnt){
-        best_cnt = cnt; best = L;
-      }
-    }
-    if (best_cnt < 2) return false;
-    inliers_idx.clear(); inliers_idx.reserve(best_cnt);
-    for (size_t k=0;k<pts.size();++k) if (lineDist(best, pts[k]) < tol) inliers_idx.push_back((int)k);
-    return true;
-  }
-
-  // --------- ★ 단일벽 상황: 폐색(occlusion) 에지 탐지 ---------
-  bool findOcclusionEdge(const sensor_msgs::msg::LaserScan& s,
-                         double fov_rad, double corridor_half,
-                         double jump_abs, double jump_ratio,
-                         Pt& p_occ, double& th_occ, double& score_out) const
-  {
-    double ang = s.angle_min, prev_ang = std::numeric_limits<double>::quiet_NaN();
-    float prev_r = std::numeric_limits<float>::quiet_NaN();
-    double best_score = -1.0;
-    Pt best_pt{0,0}; double best_th = 0.0;
-
-    for (size_t i=0;i<s.ranges.size(); ++i, ang += s.angle_increment){
-      const float r = s.ranges[i];
-      if (!std::isfinite(r) || r <= 0.05) continue;
-      if (std::abs(ang) > fov_rad) continue;
-      const double y = r * std::sin(ang);
-      if (std::abs(y) > corridor_half) continue;
-
-      if (std::isfinite(prev_r)) {
-        const double dr = (double)r - (double)prev_r;
-        const double ratio = (double)r / std::max(1e-6, (double)prev_r);
-        // 벽이 끝나며 "갑자기 멀어지는" 지점(Δr > 0, ratio 큼)
-        if (dr > jump_abs && ratio > jump_ratio) {
-          const double x_prev = prev_r * std::cos(prev_ang);
-          const double y_prev = prev_r * std::sin(prev_ang);
-          const double score  = dr * ratio;
-          if (score > best_score) {
-            best_score = score;
-            best_pt = {x_prev, y_prev};
-            best_th = prev_ang;
-          }
-        }
-      }
-      prev_r = r; prev_ang = ang;
+      Point2D p{x, y};
+      if (y >= 0.0)
+        left_wall_pts.push_back(p);
+      else
+        right_wall_pts.push_back(p);
     }
 
-    if (best_score > 0.0) {
-      p_occ = best_pt; th_occ = best_th; score_out = best_score;
-      return true;
-    }
-    return false;
-  }
+    // ---------- 2) RANSAC으로 좌/우 벽 직선 추정 ----------
+    LineModel left_wall, right_wall;
+    fitWallRANSAC(left_wall_pts, left_wall);
+    fitWallRANSAC(right_wall_pts, right_wall);
 
-  // ---------- 코너 인식 (모든 코너, 단일벽 폴백 포함) ----------
-  void detectCornerHeavy(const sensor_msgs::msg::LaserScan& s, double steer){
-    corner_conf_ = 0.0;
-
-    if (!corner_enable_) {
-      corner_active_heavy_ = false;
-      publishCornerMarkers(std::vector<Corner>{}, std::vector<RansacLine>{}, sensor_msgs::msg::LaserScan{});
-      return;
-    }
-
-    // 1) 전역 포인트 수집
-    std::vector<Pt> pool;
-    collectGlobalPoints(s, pool);
-    if ((int)pool.size() < std::max(6, min_inliers_)) {
-      updateCornerHysteresis(false, 0.0, steer);
-      publishCornerMarkers(std::vector<Corner>{}, std::vector<RansacLine>{}, sensor_msgs::msg::LaserScan{});
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-        "[CORNER] pool=%zu → TOO FEW POINTS (min_inliers=%d)", pool.size(), min_inliers_);
-      return;
-    }
-
-    // 2) 좌/우 분할 먼저 시도
-    std::vector<Pt> pos, neg; pos.reserve(pool.size()); neg.reserve(pool.size());
-    for (auto& p: pool) { (p.y >= 0 ? pos : neg).push_back(p); }
-
-    auto fit_one = [&](const std::vector<Pt>& src, RansacLine& out)->bool{
-      if ((int)src.size() < std::max(6, min_inliers_)) return false;
-      Line L; std::vector<int> idx;
-      if (!ransacLine(src, ransac_iters_, ransac_tol_, L, idx)) return false;
-      if ((int)idx.size() < std::max(8, min_inliers_)) return false;
-      out.L = L; out.inliers.clear(); out.inliers.reserve(idx.size());
-      for (int i: idx) out.inliers.push_back(src[(size_t)i]);
-      return true;
-    };
-
-    std::vector<RansacLine> lines;
-    RansacLine Lpos, Lneg;
-    bool okL = fit_one(pos, Lpos);
-    bool okR = fit_one(neg, Lneg);
-    if (okL) lines.push_back(Lpos);
-    if (okR) lines.push_back(Lneg);
-
-    // 3) 그래도 2개가 안 되면 글로벌 RANSAC로 보강
-    if (lines.size() < 2) {
-      std::vector<Pt> cur;
-      cur.reserve(pool.size());
-      auto used_by = [&](const Pt& p, const RansacLine& rl)->bool{
-        return (lineDist(rl.L, p) < ransac_tol_);
-      };
-      for (auto& p : pool){
-        bool used = false;
-        for (auto& Lx: lines) { if (used_by(p,Lx)) { used=true; break; } }
-        if (!used) cur.push_back(p);
-      }
-
-      for (int li=(int)lines.size(); li<corner_max_lines_; ++li) {
-        if ((int)cur.size() < std::max(6, min_inliers_)) break;
-        Line Lbest; std::vector<int> idx;
-        if (!ransacLine(cur, ransac_iters_, ransac_tol_, Lbest, idx)) break;
-        if ((int)idx.size() < std::max(8, min_inliers_)) break;
-
-        RansacLine RL; RL.L = Lbest; RL.inliers.reserve(idx.size());
-        std::vector<char> mark(cur.size(), 0);
-        for (int id : idx) { mark[id] = 1; RL.inliers.push_back(cur[(size_t)id]); }
-        std::vector<Pt> nxt; nxt.reserve(cur.size() - RL.inliers.size());
-        for (size_t k=0;k<cur.size();++k) if (!mark[k]) nxt.push_back(cur[k]);
-        cur.swap(nxt);
-        lines.push_back(std::move(RL));
-        if ((int)lines.size() >= 2) break;
-      }
-    }
-
-    // 4) 라인이 1개뿐이면 — 단일벽 폐색 에지 폴백
-    std::vector<Corner> corners;
-    if (lines.size() == 1) {
-      Pt occ; double th_occ=0.0, score=0.0;
-      const double fov_rad = occl_fov_deg_ * kPI()/180.0;
-      if (findOcclusionEdge(s, fov_rad, std::max(corner_y_max_, ttc_corridor_half_),
-                            occl_jump_abs_, occl_jump_ratio_, occ, th_occ, score))
-      {
-        const double n_score = std::min(1.0,
-          (double)lines[0].inliers.size() / (double)std::max(10, min_inliers_));
-        const double j_score = std::min(1.0, score / (occl_jump_abs_*occl_jump_ratio_*2.0));
-        const double conf = 0.5*j_score + 0.5*n_score;
-
-        corners.push_back(Corner{occ, 90.0, conf, 0, -1});
-
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-          "[CORNER-1WALL] occ=(%.2f, %.2f) score=%.2f n_in=%zu conf=%.2f",
-          occ.x, occ.y, score, lines[0].inliers.size(), conf);
-      }
-    }
-
-    // 5) 라인이 2개 이상이면 — 일반 교점 기반 코너
-    if (corners.empty() && lines.size() >= 2) {
-      auto add_or_merge = [&](const Corner& c){
-        for (auto& e : corners){
-          const double d = std::hypot(c.p.x-e.p.x, c.p.y-e.p.y);
-          if (d <= corner_merge_radius_){ if (c.conf > e.conf) e = c; return; }
-        }
-        corners.push_back(c);
-      };
-      for (size_t i=0;i<lines.size();++i){
-        for (size_t j=i+1;j<lines.size();++j){
-          double ang = lineAngleDeg(lines[i].L, lines[j].L);
-          if (!(ang >= angle_thresh_deg_ && ang <= 170.0)) continue;
-          Pt cross;
-          if (!lineIntersect(lines[i].L, lines[j].L, cross)) continue;
-          if (!(cross.x > 0.05 && cross.x <= intersect_max_dist_)) continue;
-          if (std::abs(cross.y) > corner_y_max_) continue;
-
-          const double a_score = std::min(1.0, std::abs(ang)/90.0);
-          const double n1 = (double)lines[i].inliers.size();
-          const double n2 = (double)lines[j].inliers.size();
-          const double n_score = std::min(1.0, std::min(n1,n2)/(double)std::max(10, min_inliers_));
-          const double conf = 0.6*a_score + 0.4*n_score;
-          add_or_merge(Corner{cross, ang, conf, (int)i, (int)j});
-        }
-      }
-    }
-
-    // 6) 조향방향 윈도우 내 코너 존재 여부 → 히스테리시스
-    bool any_front = false;
-    double best_conf = 0.0;
-    const double sideWin = corner_side_deg_ * kPI() / 180.0;
-    for (const auto& c : corners){
-      const double th  = std::atan2(c.p.y, c.p.x);
-      const double dth = std::atan2(std::sin(th - steer), std::cos(th - steer));
-      if (std::abs(dth) <= sideWin && c.p.x > 0.05){ any_front = true; best_conf = std::max(best_conf, c.conf); }
-    }
-    corner_conf_ = ema_alpha_*best_conf + (1.0-ema_alpha_)*corner_conf_;
-    updateCornerHysteresis(any_front && (corner_conf_>0.5), corner_conf_, steer);
-
-    // 7) 마커/로그
-    publishCornerMarkers(corners, lines, s);
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-      "[CORNER] pool=%zu | lines=%zu | corners=%zu | active=%d conf=%.2f",
-      pool.size(), lines.size(), corners.size(),
-      (int)corner_active_heavy_, corner_conf_);
-  }
-
-  void updateCornerHysteresis(bool corner_frame, double /*conf*/, double steer){
-    if (corner_frame){
-      corner_count_on_++; corner_count_off_ = 0;
-      if (!corner_active_heavy_ && corner_count_on_ >= corner_on_cycles_){
-        corner_active_heavy_ = true;
-        RCLCPP_INFO(this->get_logger(),
-                    "[CORNER] ON → TTC SUPPRESSED (steer=%.3f, conf=%.2f)",
-                    steer, corner_conf_);
-      }
-    }else{
-      corner_count_off_++; corner_count_on_ = 0;
-      if (corner_active_heavy_ && corner_count_off_ >= corner_off_cycles_){
-        corner_active_heavy_ = false;
-        RCLCPP_INFO(this->get_logger(),
-                    "[CORNER] OFF → TTC ENABLED (conf=%.2f, last_ttc=%.2f)",
-                    corner_conf_, ttc_min_last_);
-      }
-    }
-  }
-
-  void publishCornerMarkers(const std::vector<Corner>& corners,
-                            const std::vector<RansacLine>& lines,
-                            const sensor_msgs::msg::LaserScan& /*s*/)
-  {
-    if (!debug_markers_) return;
-    visualization_msgs::msg::MarkerArray arr;
-    const auto stamp = this->now();
-
-    int id = 100;
-
-    // (A) 코너: SPHERE + TEXT
-    for (size_t k=0;k<corners.size();++k){
-      const auto& c = corners[k];
-      visualization_msgs::msg::Marker m;
-      m.header.stamp = stamp; m.header.frame_id = debug_frame_;
-      m.ns = "pp_corner_all"; m.id = id++;
-      m.type = visualization_msgs::msg::Marker::SPHERE;
-      m.action = visualization_msgs::msg::Marker::ADD;
-      m.pose.position.x = c.p.x; m.pose.position.y = c.p.y; m.pose.position.z = 0.05;
-      m.scale.x = m.scale.y = m.scale.z = 0.14;
-      m.color.a = 1.0; m.color.r = 1.0; m.color.g = 0.8; m.color.b = 0.0;
-      arr.markers.push_back(m);
-
-      visualization_msgs::msg::Marker t;
-      t.header.stamp = stamp; t.header.frame_id = debug_frame_;
-      t.ns = "pp_corner_all"; t.id = id++;
-      t.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-      t.action = visualization_msgs::msg::Marker::ADD;
-      t.pose.position.x = c.p.x; t.pose.position.y = c.p.y; t.pose.position.z = 0.28;
-      t.scale.z = 0.12;
-      t.color.a = 1.0; t.color.r = 0.2; t.color.g = 0.9; t.color.b = 1.0;
-      std::ostringstream oss;
-      oss << "ang=" << std::fixed << std::setprecision(0) << c.ang_deg
-          << " conf=" << std::fixed << std::setprecision(2) << c.conf;
-      t.text = oss.str();
-      arr.markers.push_back(t);
-    }
-
-    // (B) 라인: LINE_STRIP
-    auto line_to_strip = [&](const Line& L, int id_local, float r,float g,float b){
-      visualization_msgs::msg::Marker ls;
-      ls.header.stamp = stamp; ls.header.frame_id = debug_frame_;
-      ls.ns = "pp_corner_all"; ls.id = id_local;
-      ls.type = visualization_msgs::msg::Marker::LINE_STRIP;
-      ls.action = visualization_msgs::msg::Marker::ADD;
-      ls.scale.x = 0.02;
-      ls.color.a = 1.0; ls.color.r = r; ls.color.g = g; ls.color.b = b;
-
-      const double xmax = std::max(0.5, intersect_max_dist_);
-      geometry_msgs::msg::Point gp;
-      if (std::abs(L.b) > 1e-6) {
-        for (double x=0.05; x<=xmax; x+=0.05){
-          double y = (-L.a*x - L.c)/L.b;
-          if (std::abs(y) > corner_y_max_) continue;
-          gp.x=x; gp.y=y; gp.z=0.01; ls.points.push_back(gp);
-        }
-      } else if (std::abs(L.a) > 1e-6) {
-        const double x = -L.c / L.a;
-        if (x >= 0.05 && x <= xmax){
-          for (double y=-corner_y_max_; y<=corner_y_max_; y+=0.05){
-            gp.x=x; gp.y=y; gp.z=0.01; ls.points.push_back(gp);
-          }
-        }
-      }
-      return ls;
-    };
-
-    for (size_t i=0;i<lines.size();++i){
-      float r = 0.2f + 0.6f * ((i%3)==0);
-      float g = 0.2f + 0.6f * ((i%3)==1);
-      float b = 0.2f + 0.6f * ((i%3)==2);
-      arr.markers.push_back(line_to_strip(lines[i].L, id++, r,g,b));
-    }
-
-    // (C) 상태 텍스트
-    {
-      visualization_msgs::msg::Marker t;
-      t.header.stamp = stamp; t.header.frame_id = debug_frame_;
-      t.ns = "pp_corner_all"; t.id = id++;
-      t.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-      t.action = visualization_msgs::msg::Marker::ADD;
-      t.pose.position.x = 0.6; t.pose.position.y = 0.0; t.pose.position.z = 0.45;
-      t.scale.z = 0.13;
-      t.color.a = 1.0; t.color.r = 0.9; t.color.g = 0.9; t.color.b = 0.9;
-      std::ostringstream oss;
-      oss << "corners=" << corners.size()
-          << " conf=" << std::fixed << std::setprecision(2) << corner_conf_
-          << " cornerActive=" << (corner_active_heavy_?1:0);
-      t.text = oss.str();
-      arr.markers.push_back(t);
-    }
-
-    pub_markers_->publish(arr);
-  }
-
-  // 1차 LPF
-  static double lpf(double x, double x_prev, double tau, double dt){
-    const double a = dt/(tau+dt);
-    return x_prev + a*(x - x_prev);
-  }
-
-  // 비대칭 Slew
-  static double slew(double target, double prev, double up, double down, double dt){
-    const double dv = target - prev;
-    const double max_step = (dv >= 0.0 ? up*dt : down*dt);
-    if (std::abs(dv) > std::abs(max_step)) {
-      return prev + std::copysign(std::abs(max_step), dv);
-    }
-    return target;
-  }
-
-  // ---------- 군집 기반 장애물 인식 -------------------------------
-  void detectObstacleClusters(const sensor_msgs::msg::LaserScan& s)
-  {
-    obstacle_clusters_.clear();
-    obstacle_front_     = false;
-    obstacle_front_dist_= 1e9;
-    obstacle_front_y_   = 0.0;
-
-    if (!obs_enable_ || s.ranges.empty()) return;
-
-    const double fov_rad   = obs_fov_deg_ * kPI() / 180.0;
-    const double x_min     = obs_x_min_;
-    const double y_half    = obs_corridor_half_;
-    const double max_r     = obs_max_range_;
-    const double th_dist   = obs_cluster_dist_;
-    const int    min_pts   = std::max(1, obs_min_points_);
-
-    std::vector<Pt> cur_pts;
+    // ---------- 3) 벽 제외하면서 군집 클러스터링 ----------
+    std::vector<ObstacleCluster> clusters_tmp;
+    std::vector<geometry_msgs::msg::Point> cur_pts;
     bool have_cluster = false;
     double prev_x = 0.0, prev_y = 0.0;
 
-    double ang = s.angle_min;
+    ang = scan.angle_min;
 
-    auto flush_cluster = [&](void){
+    auto flush_cluster = [&]() {
       if (!have_cluster) return;
       if ((int)cur_pts.size() < min_pts) {
         cur_pts.clear();
         have_cluster = false;
         return;
       }
+
       ObstacleCluster c;
       c.pts = cur_pts;
       double cx = 0.0, cy = 0.0;
@@ -641,38 +451,50 @@ private:
       c.cx = cx / (double)cur_pts.size();
       c.cy = cy / (double)cur_pts.size();
       c.r_min = (cur_pts.empty() ? 1e9 : rmin);
-      obstacle_clusters_.push_back(c);
+      clusters_tmp.push_back(c);
 
       cur_pts.clear();
       have_cluster = false;
     };
 
-    for (size_t i=0; i<s.ranges.size(); ++i, ang += s.angle_increment) {
-      float r = s.ranges[i];
+    for (size_t i=0; i<scan.ranges.size(); ++i, ang += scan.angle_increment) {
+      float r = scan.ranges[i];
 
       bool valid = true;
       if (!std::isfinite(r) || r <= 0.05f) valid = false;
       if (valid && r > (float)max_r) r = (float)max_r;
-
       if (valid && std::abs(ang) > fov_rad) valid = false;
 
       double x=0.0, y=0.0;
       if (valid) {
         x = r * std::cos(ang);
         y = r * std::sin(ang);
-        if (x < x_min || std::abs(y) > y_half) valid = false;
+
+        if (x < x_min) valid = false;
+        if (std::abs(y) > y_half) valid = false;  // 복도 밖(사이드)은 장애물 제외
+
+        // 벽 직선에 너무 가까우면 장애물에서 제외
+        if (valid) {
+          Point2D p{x,y};
+          bool is_wall = false;
+          if (left_wall.valid && pointLineDistance(left_wall, p) < wall_inlier_thresh_)
+            is_wall = true;
+          if (right_wall.valid && pointLineDistance(right_wall, p) < wall_inlier_thresh_)
+            is_wall = true;
+          if (is_wall) valid = false;
+        }
       }
 
       if (!valid) {
-        // 유효하지 않은 점 → 클러스터 끊기
         if (have_cluster) {
           flush_cluster();
         }
         continue;
       }
 
-      // 유효한 점
-      Pt pt{x, y};
+      geometry_msgs::msg::Point pt;
+      pt.x = x; pt.y = y; pt.z = 0.0;
+
       if (!have_cluster) {
         cur_pts.clear();
         cur_pts.push_back(pt);
@@ -681,7 +503,6 @@ private:
       } else {
         double d = std::hypot(x - prev_x, y - prev_y);
         if (d > th_dist) {
-          // 새로운 클러스터 시작
           flush_cluster();
           cur_pts.clear();
           cur_pts.push_back(pt);
@@ -692,601 +513,591 @@ private:
         have_cluster = true;
       }
     }
-
-    // 마지막 클러스터 처리
     flush_cluster();
 
-    // 정면 장애물 판단: 중심 y가 작은 클러스터들 중 최소 거리
-    for (const auto& c : obstacle_clusters_) {
-      if (std::abs(c.cy) <= obs_front_y_thresh_) {
-        if (c.r_min < obstacle_front_dist_) {
-          obstacle_front_dist_ = c.r_min;
-          obstacle_front_y_    = c.cy;
-          obstacle_front_      = true;
-        }
+    // ---------- 3-1) 트랙 기반 필터링 ----------
+    clusters_.clear();
+    for (const auto &c : clusters_tmp) {
+      if (isClusterInsideTrack(c)) {
+        clusters_.push_back(c);
       }
     }
 
-    // 디버그 마커 출력 (클러스터 전체)
-    publishObstacleMarkers(obstacle_clusters_);
-  }
-
-  void publishObstacleMarkers(const std::vector<ObstacleCluster>& clusters)
-  {
-    if (!debug_markers_) return;
-
-    visualization_msgs::msg::MarkerArray arr;
-    const auto stamp = this->now();
-    int id = 0;
-
-    // 각 클러스터 중심에 구(SPHERE)와 텍스트
-    for (const auto& c : clusters) {
-      visualization_msgs::msg::Marker m;
-      m.header.stamp = stamp; m.header.frame_id = debug_frame_;
-      m.ns = "pp_obstacles"; m.id = id++;
-      m.type = visualization_msgs::msg::Marker::SPHERE;
-      m.action = visualization_msgs::msg::Marker::ADD;
-      m.pose.position.x = c.cx;
-      m.pose.position.y = c.cy;
-      m.pose.position.z = 0.05;
-      m.scale.x = m.scale.y = m.scale.z = 0.18;
-      m.color.a = 1.0;
-      m.color.r = 1.0;
-      m.color.g = 0.2;
-      m.color.b = 0.2;
-      arr.markers.push_back(m);
-
-      visualization_msgs::msg::Marker t;
-      t.header.stamp = stamp; t.header.frame_id = debug_frame_;
-      t.ns = "pp_obstacles"; t.id = id++;
-      t.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-      t.action = visualization_msgs::msg::Marker::ADD;
-      t.pose.position.x = c.cx;
-      t.pose.position.y = c.cy;
-      t.pose.position.z = 0.30;
-      t.scale.z = 0.12;
-      t.color.a = 1.0;
-      t.color.r = 1.0;
-      t.color.g = 1.0;
-      t.color.b = 1.0;
-      std::ostringstream oss;
-      oss << "rmin=" << std::fixed << std::setprecision(2) << c.r_min;
-      t.text = oss.str();
-      arr.markers.push_back(t);
+    // ===== 장애물 최소 거리 계산 =====
+    nearest_obstacle_dist_ = std::numeric_limits<double>::infinity();
+    for (const auto &c : clusters_) {
+      if (std::abs(c.cy) > obs_front_y_thresh_) continue;
+      double d = c.r_min;
+      if (d < nearest_obstacle_dist_) {
+        nearest_obstacle_dist_ = d;
+      }
     }
+    has_obstacle_ = std::isfinite(nearest_obstacle_dist_);
 
-    // 상태 텍스트 하나
-    {
-      visualization_msgs::msg::Marker t;
-      t.header.stamp = stamp; t.header.frame_id = debug_frame_;
-      t.ns = "pp_obstacles"; t.id = id++;
-      t.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-      t.action = visualization_msgs::msg::Marker::ADD;
-      t.pose.position.x = 0.6;
-      t.pose.position.y = 0.0;
-      t.pose.position.z = 0.55;
-      t.scale.z = 0.13;
-      t.color.a = 1.0;
-      t.color.r = 0.8;
-      t.color.g = 1.0;
-      t.color.b = 0.8;
-      std::ostringstream oss;
-      oss << "obs_front=" << (obstacle_front_ ? 1 : 0)
-          << " dist=" << std::fixed << std::setprecision(2) << obstacle_front_dist_;
-      t.text = oss.str();
-      arr.markers.push_back(t);
-    }
-
-    pub_obs_markers_->publish(arr);
-  }
-  // ----------------------------------------------------------------
-
-  // ★ 정면 장애물 하나만 찍는 Marker (SPHERE) 퍼블리셔 -------------
-  void publishObstacleMarker(bool has_obstacle, double x_obs, double y_obs)
-  {
-    visualization_msgs::msg::Marker m;
-    m.header.stamp = this->now();
-    m.header.frame_id = debug_frame_;      // 보통 "base_link"
-    m.ns = "pp_obstacle_front";
-    m.id = 0;
-    m.type = visualization_msgs::msg::Marker::SPHERE;
-    m.action = has_obstacle
-               ? visualization_msgs::msg::Marker::ADD
-               : visualization_msgs::msg::Marker::DELETE;
-
-    m.pose.position.x = x_obs;
-    m.pose.position.y = y_obs;
-    m.pose.position.z = 0.1;               // 살짝 띄우기
-    m.pose.orientation.w = 1.0;           // 회전 없음
-
-    m.scale.x = 0.3;
-    m.scale.y = 0.3;
-    m.scale.z = 0.3;
-
-    m.color.a = 1.0;
-    m.color.r = 0.0;
-    m.color.g = 1.0;                      // 초록색
-    m.color.b = 0.0;
-
-    // lifetime은 기본값(0) → 계속 유지
-    pub_obs_single_marker_->publish(m);
-  }
-
-  // ★ 별도 타이머 콜백: obstacle_front_ 상태를 보고 마커 갱신 -----
-  void onObsMarkerTimer()
-  {
-    if (!debug_markers_) return;
-
-    if (obstacle_front_) {
-      // detectObstacleClusters에서 세팅된 가장 가까운 정면 장애물
-      double x_obs = obstacle_front_dist_;
-      double y_obs = obstacle_front_y_;
-      publishObstacleMarker(true, x_obs, y_obs);
+    // ----- 장애물 히스테리시스 (깜빡임 방지) -----
+    if (!has_obstacle_stable_) {
+      // 꺼져 있을 때: 슬로우 구간 안까지 들어와야 ON
+      if (has_obstacle_ && nearest_obstacle_dist_ < obstacle_slow_dist_) {
+        has_obstacle_stable_ = true;
+      }
     } else {
-      // 장애물 없으면 마커 삭제
-      publishObstacleMarker(false, 0.0, 0.0);
+      // 켜져 있을 때: 충분히 멀어지거나 장애물이 사라져야 OFF
+      if (!has_obstacle_ || nearest_obstacle_dist_ > obstacle_slow_dist_ + 1.0) {
+        has_obstacle_stable_ = false;
+      }
     }
+
+    // ---------- 마커들 ----------
+    publishObstacleMarkers(clusters_);
+    publishWallMarkers(left_wall, right_wall);
+
+    // ---------- FTG 타겟 계산 ----------
+    computeFTGTargetFromScan(scan);
   }
-  // ----------------------------------------------------------------
-  
-    // ----------------------------------------------------------------
-  // ★ 군집 결과(obstacle_clusters_)를 이용한 FTG 조향 계산 ----------
-  bool computeFTGSteer(double dir_pp, double Ld, double& steer_out)
+
+  // ===== FTG 타겟 조향 계산 (정면 장애물 시 좌/우 갭 선호) =====
+  void computeFTGTargetFromScan(const sensor_msgs::msg::LaserScan &scan)
   {
-    if (!ftg_enable_) return false;
-    if (obstacle_clusters_.empty()) return false;
+    has_ftg_target_ = false;
+    steer_ftg_ = 0.0;
 
-    const double fov_rad      = ftg_fov_deg_          * kPI() / 180.0;
-    const double min_gap_rad  = ftg_min_gap_deg_      * kPI() / 180.0;
-    const double margin_rad   = ftg_block_margin_deg_ * kPI() / 180.0;
+    if (scan.ranges.empty()) return;
 
-    // 1) FTG 개입 필요 여부: FTG 시야 안에서 일정 거리 이내 클러스터가 있는지 확인
-    bool need_ftg = false;
-    for (const auto& c : obstacle_clusters_) {
-      const double r  = std::hypot(c.cx, c.cy);
-      const double th = std::atan2(c.cy, c.cx);
-      if (std::abs(th) > fov_rad) continue;
-      if (r < ftg_force_dist_) {
-        need_ftg = true;
-        break;
-      }
-    }
-    if (!need_ftg) return false;
+    double fov_rad = obs_fov_deg_ * M_PI / 180.0;
 
-    // 2) 각 클러스터를 "막힌 각도 구간"으로 변환
-    struct Interval { double s, e; };
-    std::vector<Interval> blocked;
-    blocked.reserve(obstacle_clusters_.size());
-
-    for (const auto& c : obstacle_clusters_) {
-      if (c.pts.empty()) continue;
-
-      double th_min =  1e9;
-      double th_max = -1e9;
-      for (const auto& pt : c.pts) {
-        double th = std::atan2(pt.y, pt.x);
-        if (th < th_min) th_min = th;
-        if (th > th_max) th_max = th;
-      }
-      if (th_min > 1e8) continue;
-
-      th_min -= margin_rad;
-      th_max += margin_rad;
-
-      // FTG FOV 밖이면 무시
-      if (th_max < -fov_rad || th_min > fov_rad) continue;
-
-      th_min = std::max(th_min, -fov_rad);
-      th_max = std::min(th_max,  fov_rad);
-      if (th_max <= th_min) continue;
-
-      blocked.push_back({th_min, th_max});
+    // 1) 먼저 FOV 안에서 최소 거리(min_r)를 구해서 "가까운 장애물 모드" 여부 결정
+    double min_r = std::numeric_limits<double>::infinity();
+    double ang = scan.angle_min;
+    for (size_t i=0; i<scan.ranges.size(); ++i, ang += scan.angle_increment) {
+      float r = scan.ranges[i];
+      if (std::abs(ang) > fov_rad) continue;
+      if (!std::isfinite(r) || r <= 0.05f) continue;
+      if (r > (float)obs_max_range_) r = (float)obs_max_range_;
+      if (r < min_r) min_r = r;
     }
 
-    if (blocked.empty()) return false;
+    if (!std::isfinite(min_r)) {
+      // 유효한 포인트가 없음
+      return;
+    }
 
-    // 3) 막힌 구간 merge
-    std::sort(blocked.begin(), blocked.end(),
-              [](const Interval& a, const Interval& b){ return a.s < b.s; });
+    const double close_thresh = 3.0;     // 이 거리 안이면 "가까운 장애물"로 판단
+    const bool   near_mode    = (min_r < close_thresh);
+    const double lateral_gain = 2.0;     // 좌/우로 벌어진 방향을 선호하는 가중치
 
-    std::vector<Interval> merged;
-    for (const auto& it : blocked) {
-      if (merged.empty() || it.s > merged.back().e) {
-        merged.push_back(it);
-      } else {
-        if (it.e > merged.back().e) merged.back().e = it.e;
+    // 2) 점수 기반으로 최적 각도 선택
+    double best_score = -1e9;
+    double best_r  = -1.0;
+    double best_th = 0.0;
+
+    ang = scan.angle_min;
+    for (size_t i=0; i<scan.ranges.size(); ++i, ang += scan.angle_increment) {
+      float r = scan.ranges[i];
+      if (std::abs(ang) > fov_rad) continue;
+      if (!std::isfinite(r) || r <= 0.05f) continue;
+
+      if (r > (float)obs_max_range_) r = (float)obs_max_range_;
+
+      // 기본은 "더 멀리 뚫린 방향" 선호
+      double score = r;
+
+      if (near_mode) {
+        // 가까운 장애물이 있을 때는 정면(ang≈0)을 피하고
+        // 좌/우로 벌어진 방향(|ang| 큰 곳)을 추가 가점
+        double norm_ang = std::abs(ang) / fov_rad; // 0~1
+        score += lateral_gain * norm_ang;
+      }
+
+      if (score > best_score) {
+        best_score = score;
+        best_r     = r;
+        best_th    = ang;  // base_link 기준 각도
       }
     }
 
-    // 4) [-fov, +fov]에서의 "빈 gap" 구간 계산
-    std::vector<Interval> gaps;
-    double cur = -fov_rad;
-    for (const auto& it : merged) {
-      if (it.s > cur) {
-        gaps.push_back({cur, it.s});
-      }
-      cur = std::max(cur, it.e);
-    }
-    if (cur < fov_rad) {
-      gaps.push_back({cur, fov_rad});
+    if (best_r <= 0.0) {
+      has_ftg_target_ = false;
+      return;
     }
 
-    if (gaps.empty()) {
-      // 완전히 막힌 경우 → PP 유지
-      return false;
+    // Pure Pursuit 형식으로 FTG 타겟 조향 계산
+    double r = std::min(best_r, 4.0);  // 너무 멀면 Ld 상한 4m 정도
+    double y = r * std::sin(best_th);
+
+    if (r < 0.5) {
+      // 너무 가까운 점은 사용하지 않음
+      has_ftg_target_ = false;
+      return;
     }
 
-    // 5) PP가 원하는 방향(dir_pp)을 최대한 살려서 gap 선택
-    double dir_clamped = std::clamp(dir_pp, -fov_rad, fov_rad);
-    double alpha_best  = 0.0;
-    bool   have_best   = false;
+    double kappa = 2.0 * y / (r * r);
+    double steer = std::atan(wheelbase_ * kappa);
 
-    // (A) 먼저 "PP 방향이 들어가는 gap"이 있으면 그 안에서 그대로 진행
-    for (const auto& g : gaps) {
-      double w = g.e - g.s;
-      if (w < min_gap_rad) continue;
-      if (dir_clamped > g.s && dir_clamped < g.e) {
-        alpha_best = dir_clamped;
-        have_best  = true;
-        break;
-      }
-    }
+    // FTG 조향 한도
+    steer = std::clamp(steer, -steer_ftg_max_, steer_ftg_max_);
 
-    // (B) 없으면: 가장 넓은 gap 중심을 선택하되, PP 방향과 가까운 쪽을 선호
-    if (!have_best) {
-      double best_score = -1.0;
-      for (const auto& g : gaps) {
-        double w = g.e - g.s;
-        if (w < min_gap_rad) continue;
-        double center = 0.5 * (g.s + g.e);
-        // gap이 넓을수록 좋고, PP 방향과 가까울수록 좋게 점수 부여
-        double score = w - 0.5 * std::abs(center - dir_clamped);
-        if (score > best_score) {
-          best_score = score;
-          alpha_best = center;
-          have_best  = true;
-        }
-      }
-    }
-
-    if (!have_best) return false;
-
-    // 6) 선택된 각도 alpha_best를 목표 진행 방향으로 보고 곡률/조향 계산
-    double L = std::max(Ld, 0.5);                 // 너무 작지 않게
-    double curvature = 2.0 * std::sin(alpha_best) / std::max(L, 0.1);
-    steer_out = std::atan(wheelbase_ * curvature);
-
-    return true;
+    steer_ftg_ = steer;
+    has_ftg_target_ = true;
   }
-  // ----------------------------------------------------------------
 
+  // 군집 중심 마커 (장애물)
+  void publishObstacleMarkers(const std::vector<ObstacleCluster> &clusters)
+  {
+    visualization_msgs::msg::Marker mk;
+    mk.header.frame_id = scan_frame_id_;
+    mk.header.stamp = now();
+    mk.ns = "obstacle_clusters";
+    mk.id = 0;
+    mk.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+    mk.action = visualization_msgs::msg::Marker::ADD;
 
-  void onTimer() {
-    if (!has_odom_ || center_path_.poses.empty()) return;
+    mk.scale.x = 0.25;
+    mk.scale.y = 0.25;
+    mk.scale.z = 0.25;
 
-    // 현재 포즈/자세
+    mk.color.r = 1.0f;
+    mk.color.g = 1.0f;
+    mk.color.b = 0.0f;
+    mk.color.a = 1.0f;
+
+    mk.points.clear();
+
+    for (const auto &c : clusters) {
+      if (std::abs(c.cy) > obs_front_y_thresh_) continue;
+
+      geometry_msgs::msg::Point p;
+      p.x = c.cx;
+      p.y = c.cy;
+      p.z = 0.0;
+      mk.points.push_back(p);
+    }
+
+    if (mk.points.empty()) {
+      mk.action = visualization_msgs::msg::Marker::DELETE;
+    }
+
+    mk.lifetime = rclcpp::Duration::from_seconds(0.1);
+    obstacle_marker_pub_->publish(mk);
+  }
+
+  // ===== 벽 RANSAC 보조 =====
+  static double pointLineDistance(const LineModel &line, const Point2D &p) {
+    if (!line.valid) return 1e9;
+    return std::fabs(line.a * p.x + line.b * p.y + line.c) /
+           std::sqrt(line.a*line.a + line.b*line.b);
+  }
+
+  void fitWallRANSAC(const std::vector<Point2D> &pts, LineModel &best_model) {
+    best_model.valid = false;
+    if (pts.size() < 2) return;
+
+    const int max_iters   = wall_ransac_iters_;
+    const int min_inliers = wall_ransac_min_inliers_;
+
+    std::uniform_int_distribution<int> dist_idx(0, (int)pts.size() - 1);
+
+    int best_inliers = 0;
+
+    for (int it = 0; it < max_iters; ++it) {
+      int i1 = dist_idx(rng_);
+      int i2 = dist_idx(rng_);
+      if (i1 == i2) continue;
+
+      const auto &p1 = pts[i1];
+      const auto &p2 = pts[i2];
+
+      double dx = p2.x - p1.x;
+      double dy = p2.y - p1.y;
+      if (std::hypot(dx, dy) < 1e-3) continue;
+
+      LineModel candidate;
+      candidate.a =  dy;
+      candidate.b = -dx;
+      candidate.c = -(candidate.a * p1.x + candidate.b * p1.y);
+      candidate.valid = true;
+
+      int inliers = 0;
+      for (const auto &p : pts) {
+        double d = pointLineDistance(candidate, p);
+        if (d < wall_inlier_thresh_) ++inliers;
+      }
+
+      if (inliers > best_inliers) {
+        best_inliers = inliers;
+        best_model = candidate;
+        best_model.valid = true;
+      }
+    }
+
+    if (!best_model.valid || best_inliers < min_inliers) {
+      best_model.valid = false;
+    }
+  }
+
+  // 벽 마커 (보라색 LINE_LIST) publish
+  void publishWallMarkers(const LineModel &left_wall, const LineModel &right_wall) {
+    visualization_msgs::msg::Marker mk;
+    mk.header.frame_id = scan_frame_id_;
+    mk.header.stamp = now();
+    mk.ns = "walls";
+    mk.id = 0;
+    mk.type = visualization_msgs::msg::Marker::LINE_LIST;
+    mk.action = visualization_msgs::msg::Marker::ADD;
+
+    mk.scale.x = 0.05;
+
+    mk.color.r = 1.0f;
+    mk.color.g = 0.0f;
+    mk.color.b = 1.0f;
+    mk.color.a = 1.0f;
+
+    mk.points.clear();
+
+    auto add_line = [&](const LineModel &line) {
+      if (!line.valid) return;
+      double x0 = obs_x_min_;
+      double x1 = obs_max_range_;
+
+      if (std::fabs(line.b) < 1e-6) return;
+
+      geometry_msgs::msg::Point p1, p2;
+      p1.x = x0;
+      p1.y = -(line.a * x0 + line.c) / line.b;
+      p1.z = 0.0;
+
+      p2.x = x1;
+      p2.y = -(line.a * x1 + line.c) / line.b;
+      p2.z = 0.0;
+
+      mk.points.push_back(p1);
+      mk.points.push_back(p2);
+    };
+
+    add_line(left_wall);
+    add_line(right_wall);
+
+    if (mk.points.empty()) {
+      mk.action = visualization_msgs::msg::Marker::DELETE;
+    }
+
+    mk.lifetime = rclcpp::Duration::from_seconds(0.1);
+    wall_marker_pub_->publish(mk);
+  }
+
+  // ======================= 트랙 기반 장애물 필터 =======================
+  bool clusterCenterToMap(const ObstacleCluster &c, double &X, double &Y) const
+  {
+    if (!has_odom_) return false;
+
     const auto &p = odom_.pose.pose.position;
     const auto &q = odom_.pose.pose.orientation;
+
     double roll, pitch, yaw;
     tf2::Quaternion tq(q.x, q.y, q.z, q.w);
     tf2::Matrix3x3(tq).getRPY(roll, pitch, yaw);
-    const double x = p.x, y = p.y;
-    const double v = odom_.twist.twist.linear.x;
 
-    // 동적 룩어헤드
-    const double Ld_target = std::clamp(ld0_ + kv_ld_ * v, ld_min_, ld_max_);
+    double x = c.cx;
+    double y = c.cy;
 
-    // 타깃 인덱스
-    const int target_idx = findLookaheadIndex(center_path_, x, y, Ld_target);
-    if (target_idx < 0) return;
-    const auto &tp = center_path_.poses[target_idx].pose.position;
-
-    // ★ 인코스 바이어스 적용을 위한 목표점 초기값 (센터라인)
-    double goal_x = tp.x;
-    double goal_y = tp.y;
-
-    if (inner_bias_enable_) {
-      const double kappa_path = computePathCurvature(center_path_, target_idx);
-      const double kappa_abs  = std::fabs(kappa_path);
-
-      if (kappa_abs > inner_bias_kappa_thresh_) {
-        double d = inner_bias_gain_ * (kappa_abs - inner_bias_kappa_thresh_);
-        if (d > inner_bias_offset_max_) d = inner_bias_offset_max_;
-        if (d < 0.0) d = 0.0;
-
-        const double yaw_path = computePathYaw(center_path_, target_idx);
-
-        double nx = -std::sin(yaw_path);
-        double ny =  std::cos(yaw_path);
-        if (kappa_path < 0.0) { // 우코너 → 반대 방향
-          nx = -nx;
-          ny = -ny;
-        }
-
-        goal_x += nx * d;
-        goal_y += ny * d;
-      }
-    }
-
-    // 차량좌표계
-    const double dx = goal_x - x;
-    const double dy = goal_y - y;
-    if (dx <= 0.01 && std::hypot(dx,dy) < 0.1) return;
-
-    const double xL =  std::cos(yaw) * dx + std::sin(yaw) * dy;
-    const double yL = -std::sin(yaw) * dx + std::cos(yaw) * dy;
-    if (xL <= 0.01) return;
-
-    // PP 기하
-    const double Ld = std::hypot(xL, yL);
-    const double curvature = 2.0 * yL / (Ld * Ld);
-    const double steer_pp  = std::atan(wheelbase_ * curvature);
-    
-    // ★ base_link 기준 PP 진행 방향(레이 방향)
-    const double dir_pp = std::atan2(yL, xL);
-
-    // 코너 인식
-    if (has_ttc_scan_) {
-      detectCornerHeavy(last_ttc_scan_, steer_pp);
-    } else {
-      corner_active_heavy_ = false; corner_conf_=0.0;
-    }
-
-    // (1) 곡률 기반 속도 상한
-    const double kappa_eff = std::max(1e-6, curv_gain_speed_ * std::abs(curvature));
-    double v_curv = (kappa_eff < 1e-4) ? v_max_
-               : std::sqrt(std::max(1e-6, ay_max_ / kappa_eff));
-    v_curv = std::clamp(v_curv, v_min_, v_max_);
-
-    // (2) TTC 기반 속도 상한
-    double v_ttc = v_max_;
-    double ttc_min = ttc_min_last_;
-    if (has_ttc_scan_) {
-      ttc_min = computeMinTTC(
-        last_ttc_scan_,
-        std::max(0.0, v),
-        ttc_fov_deg_ * kPI() / 180.0,
-        ttc_corridor_half_);
-      ttc_min_last_ = ttc_min;
-
-      if (!corner_active_heavy_) {
-        if (ttc_min < ttc_gate_) {
-          v_ttc = std::clamp(k_ttc_ * (ttc_min - ttc_safe_), 0.0, v_max_);
-        } else {
-          v_ttc = v_max_;
-        }
-      } else {
-        v_ttc = v_max_; // 코너 활성 시 TTC 억제
-      }
-
-      // ★ 여기서 군집 기반 장애물 인식 수행 (제어에는 아직 미반영, 디버그만)
-      detectObstacleClusters(last_ttc_scan_);
-      {
-        std_msgs::msg::Bool b;      b.data   = obstacle_front_;
-        std_msgs::msg::Float32 d;   d.data   = static_cast<float>(obstacle_front_dist_);
-        pub_obs_front_->publish(b);
-        pub_obs_dist_->publish(d);
-      }
-
-    } else {
-      obstacle_front_      = false;
-      obstacle_front_dist_ = 1e9;
-    }
-
-    // (3) 최종 v_ref: min(곡률, TTC) → LPF → Slew
-    const double v_ref_raw = std::min(v_curv, v_ttc);
-    const double v_ref_lpf = lpf(v_ref_raw, v_cmd_prev_, tau_v_, 0.01);
-    const double v_ref     = slew(v_ref_lpf, v_cmd_prev_, a_ref_up_, a_ref_down_, 0.01);
-    v_cmd_prev_ = v_ref;
-
-    // (4) 데드밴드 + P제어 + 포화
-    double err = v_ref - v;
-    if (std::abs(err) < v_deadband_) err = 0.0;
-
-    double a_cmd = k_accel_ * err;
-    if (a_cmd > a_max_) a_cmd = a_max_;
-    if (a_cmd < a_min_) a_cmd = a_min_;
-
-    // 기본은 PP 조향
-    double steer_cmd = steer_pp;
-
-    // ★ 군집 기반 FTG로 조향 보정 (장애물이 가까이 있을 때만)
-    if (ftg_enable_ && has_ttc_scan_) {
-      double steer_ftg;
-      if (computeFTGSteer(dir_pp, Ld, steer_ftg)) {
-        steer_cmd = steer_ftg;
-      }
-    }
-
-
-    // 퍼블리시
-    ackermann_msgs::msg::AckermannDriveStamped cmd;
-    cmd.header.stamp = now();
-    cmd.header.frame_id = "base_link0";
-    cmd.drive.steering_angle = steer_cmd;
-    cmd.drive.acceleration   = a_cmd;
-    cmd.drive.speed          = 0.0;
-
-    drive_pub_->publish(cmd);
-
-    // 디버그 퍼블리시
-    {
-      std_msgs::msg::Bool b;      b.data   = corner_active_heavy_;
-      std_msgs::msg::Float32 cf;  cf.data  = static_cast<float>(corner_conf_);
-      std_msgs::msg::Float32 tt;  tt.data  = static_cast<float>(ttc_min_last_);
-      pub_corner_active_->publish(b);
-      pub_corner_conf_->publish(cf);
-      pub_ttc_min_->publish(tt);
-    }
-
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-      "v=%.2f v_ref=%.2f (curv=%.2f ttc=%.2f cap=%.2f) a=%.2f Ld=%.2f steer=%.3f obs_front=%d dist=%.2f",
-      v, v_ref, v_curv, ttc_min, v_ttc, a_cmd, Ld_target,
-      steer_cmd, (int)obstacle_front_, obstacle_front_dist_);
+    X = p.x + std::cos(yaw) * x - std::sin(yaw) * y;
+    Y = p.y + std::sin(yaw) * x + std::cos(yaw) * y;
+    return true;
   }
 
-  // Ld 이상 떨어진 첫 점 찾기
+  double distanceToPath(const nav_msgs::msg::Path &path, double X, double Y) const
+  {
+    if (path.poses.empty()) return 1e9;
+
+    double best2 = 1e18;
+    for (const auto &ps : path.poses) {
+      double dx = ps.pose.position.x - X;
+      double dy = ps.pose.position.y - Y;
+      double d2 = dx*dx + dy*dy;
+      if (d2 < best2) best2 = d2;
+    }
+    return std::sqrt(best2);
+  }
+
+  bool isClusterInsideTrack(const ObstacleCluster &c) const
+  {
+    if (left_path_.poses.empty() || right_path_.poses.empty()) {
+      return true;
+    }
+
+    double X, Y;
+    if (!clusterCenterToMap(c, X, Y)) {
+      return false;
+    }
+
+    double dL = distanceToPath(left_path_,  X, Y);
+    double dR = distanceToPath(right_path_, X, Y);
+    double d_min = std::min(dL, dR);
+
+    if (d_min < track_wall_margin_) {
+      return false;
+    }
+
+    const nav_msgs::msg::Path *center_for_class = nullptr;
+    if (!center_path_from_topic_.poses.empty()) {
+      center_for_class = &center_path_from_topic_;
+    } else if (!center_path_.poses.empty()) {
+      center_for_class = &center_path_;
+    }
+
+    if (center_for_class) {
+      double dC = distanceToPath(*center_for_class, X, Y);
+      if (dC > track_center_max_dist_) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  // ======================= 마커/유틸 =======================
+  void publishLookaheadMarker(const geometry_msgs::msg::Point &pt) {
+    visualization_msgs::msg::Marker mk;
+    mk.header.frame_id = "map";
+    mk.header.stamp = now();
+    mk.ns = "lookahead_point";
+    mk.id = 0;
+    mk.type = visualization_msgs::msg::Marker::SPHERE;
+    mk.action = visualization_msgs::msg::Marker::ADD;
+
+    mk.pose.position = pt;
+    mk.pose.position.z = 0.1;
+    mk.pose.orientation.x = 0.0;
+    mk.pose.orientation.y = 0.0;
+    mk.pose.orientation.z = 0.0;
+    mk.pose.orientation.w = 1.0;
+
+    mk.scale.x = 0.3;
+    mk.scale.y = 0.3;
+    mk.scale.z = 0.3;
+
+    mk.color.r = 0.0f;
+    mk.color.g = 1.0f;
+    mk.color.b = 0.0f;
+    mk.color.a = 1.0f;
+
+    mk.lifetime = rclcpp::Duration::from_seconds(0.2);
+    lookahead_pub_->publish(mk);
+  }
+
+  void publishCurvaturePointsMarker(const std::vector<geometry_msgs::msg::Point> &pts) {
+    visualization_msgs::msg::Marker mk;
+    mk.header.frame_id = "map";
+    mk.header.stamp = now();
+    mk.ns = "curvature_points";
+    mk.id = 0;
+    mk.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+    mk.action = visualization_msgs::msg::Marker::ADD;
+
+    mk.scale.x = 0.25;
+    mk.scale.y = 0.25;
+    mk.scale.z = 0.25;
+
+    mk.color.r = 1.0f;
+    mk.color.g = 0.0f;
+    mk.color.b = 0.0f;
+    mk.color.a = 1.0f;
+
+    mk.points = pts;
+    mk.lifetime = rclcpp::Duration::from_seconds(0.2);
+    curvature_pub_->publish(mk);
+  }
+
   static int findLookaheadIndex(const nav_msgs::msg::Path &path,
                                 double x, double y, double Ld) {
+    if (path.poses.empty()) return -1;
+
     int closest = 0;
     double best = 1e18;
-    for (size_t i=0; i<path.poses.size(); ++i) {
+    for (size_t i = 0; i < path.poses.size(); ++i) {
       const auto &pt = path.poses[i].pose.position;
-      const double d2 = (pt.x - x)*(pt.x - x) + (pt.y - y)*(pt.y - y);
+      double d2 = (pt.x - x)*(pt.x - x) + (pt.y - y)*(pt.y - y);
       if (d2 < best) { best = d2; closest = static_cast<int>(i); }
     }
+
     double accum = 0.0;
-    for (size_t i=closest; i+1<path.poses.size(); ++i) {
+    for (size_t step = 0; step + 1 < path.poses.size(); ++step) {
+      int i = (closest + step) % path.poses.size();
+      int j = (closest + step + 1) % path.poses.size();
       const auto &a = path.poses[i].pose.position;
-      const auto &b = path.poses[i+1].pose.position;
+      const auto &b = path.poses[j].pose.position;
       accum += std::hypot(b.x - a.x, b.y - a.y);
-      if (accum >= Ld) return static_cast<int>(i+1);
+      if (accum >= Ld) return j;
     }
-    if (!path.poses.empty()) return static_cast<int>(path.poses.size()-1);
-    return -1;
+    return closest;
   }
 
-  // 인코스용: center_path의 국소 곡률 계산
-  static double computePathCurvature(const nav_msgs::msg::Path &path,
-                                     int idx)
+  double computeMaxCurvatureAhead(const nav_msgs::msg::Path &path,
+                                  double x, double y,
+                                  double L_curv, double step_spacing,
+                                  std::vector<geometry_msgs::msg::Point> &preview_pts)
   {
-    const auto &poses = path.poses;
-    const int n = (int)poses.size();
-    if (n < 3) return 0.0;
+    (void)step_spacing;
+    preview_pts.clear();
+    if (path.poses.size() < 3) return 0.0;
 
-    int i = std::clamp(idx, 1, n-2);
-    const auto &pm = poses[i-1].pose.position;
-    const auto &p  = poses[i].pose.position;
-    const auto &pp = poses[i+1].pose.position;
+    int closest = 0;
+    double best = 1e18;
+    for (size_t i = 0; i < path.poses.size(); ++i) {
+      const auto &pt = path.poses[i].pose.position;
+      double d2 = (pt.x - x)*(pt.x - x) + (pt.y - y)*(pt.y - y);
+      if (d2 < best) { best = d2; closest = static_cast<int>(i); }
+    }
 
-    const double yaw1 = std::atan2(p.y - pm.y,  p.x - pm.x);
-    const double yaw2 = std::atan2(pp.y - p.y,  pp.x - p.x);
-    const double dyaw = std::atan2(std::sin(yaw2 - yaw1), std::cos(yaw2 - yaw1));
-    const double ds   = std::hypot(pp.x - pm.x, pp.y - pm.y);
-    if (ds < 1e-3) return 0.0;
+    double accum = 0.0;
+    double max_kappa = 0.0;
 
-    return dyaw / ds;   // [1/m]
+    preview_pts.push_back(path.poses[closest].pose.position);
+    int curr_idx = closest;
+
+    while (accum < L_curv) {
+      int next_idx = (curr_idx + 1) % path.poses.size();
+      const auto &a = path.poses[curr_idx].pose.position;
+      const auto &b = path.poses[next_idx].pose.position;
+      double ds = std::hypot(b.x - a.x, b.y - a.y);
+      if (ds < 1e-6) break;
+
+      accum += ds;
+      curr_idx = next_idx;
+      preview_pts.push_back(path.poses[curr_idx].pose.position);
+
+      int n = static_cast<int>(preview_pts.size());
+      if (n >= 3) {
+        const auto &p1 = preview_pts[n-3];
+        const auto &p2 = preview_pts[n-2];
+        const auto &p3 = preview_pts[n-1];
+
+        double kappa = computeCurvatureThreePoints(p1, p2, p3);
+        if (std::abs(kappa) > std::abs(max_kappa)) {
+          max_kappa = kappa;
+        }
+      }
+
+      if (accum >= L_curv) break;
+    }
+
+    return max_kappa;
   }
 
-  // 인코스용: center_path의 국소 진행방향 yaw 계산
-  static double computePathYaw(const nav_msgs::msg::Path &path,
-                               int idx)
+  static double computeCurvatureThreePoints(const geometry_msgs::msg::Point &p1,
+                                            const geometry_msgs::msg::Point &p2,
+                                            const geometry_msgs::msg::Point &p3)
   {
-    const auto &poses = path.poses;
-    const int n = (int)poses.size();
-    if (n < 2) return 0.0;
+    double x1 = p1.x, y1 = p1.y;
+    double x2 = p2.x, y2 = p2.y;
+    double x3 = p3.x, y3 = p3.y;
 
-    int i0 = std::max(0, idx-1);
-    int i1 = std::min(n-1, idx+1);
-    const auto &p0 = poses[i0].pose.position;
-    const auto &p1 = poses[i1].pose.position;
+    double a = std::hypot(x2 - x1, y2 - y1);
+    double b = std::hypot(x3 - x2, y3 - y2);
+    double c = std::hypot(x3 - x1, y3 - y1);
 
-    return std::atan2(p1.y - p0.y, p1.x - p0.x);
+    double s = 0.5 * (a + b + c);
+    double area2 = s * (s - a) * (s - b) * (s - c);
+    if (area2 <= 1e-12) return 0.0;
+
+    double area = std::sqrt(area2);
+    double radius = (a * b * c) / (4.0 * area);
+    double kappa = 1.0 / radius;
+
+    double vx1 = x2 - x1;
+    double vy1 = y2 - y1;
+    double vx2 = x3 - x2;
+    double vy2 = y3 - y2;
+    double cross = vx1 * vy2 - vy1 * vx2;
+    if (cross < 0.0) kappa = -kappa;
+
+    return kappa;
   }
 
-  // ----- 멤버 -----
+  // ----- 멤버 변수 -----
   rclcpp::Publisher<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr drive_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr raceline_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr lookahead_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr curvature_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr obstacle_marker_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr wall_marker_pub_;
+
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr sub_center_, sub_left_, sub_right_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
-  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub_ttc_scan_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub_scan_;
   rclcpp::TimerBase::SharedPtr timer_;
-  rclcpp::TimerBase::SharedPtr obs_marker_timer_;  // ★ 추가: 장애물 마커용 타이머
 
-  nav_msgs::msg::Path center_path_, left_path_, right_path_;
+  nav_msgs::msg::Path center_path_;
+  nav_msgs::msg::Path center_path_from_topic_;
+  nav_msgs::msg::Path left_path_, right_path_;
+
   nav_msgs::msg::Odometry odom_;
-  sensor_msgs::msg::LaserScan last_ttc_scan_;
-  bool has_odom_{false}, has_ttc_scan_{false};
+  bool has_odom_{false};
 
-  // 파라미터/상태
   double lookahead_, wheelbase_;
-  double v_min_, v_max_, k_speed_;
+  double v_min_, v_max_;
   double k_accel_, a_min_, a_max_;
-  std::string center_path_topic_, left_path_topic_, right_path_topic_, odom_topic_, drive_topic_;
 
-  double ay_max_, ld0_, kv_ld_, ld_min_, ld_max_;
-  double ttc_safe_, k_ttc_, tau_v_, ttc_gate_;
-  std::string ttc_scan_topic_;
+  double kv_ld_, ld_min_, ld_max_;
+  double k_ld_curv_;
 
-  double a_ref_up_, a_ref_down_, v_deadband_;
-  double v_cmd_prev_{0.0};
+  double curv_preview_t_, curv_preview_min_, curv_preview_max_;
+  double curv_preview_step_;
 
-  double ttc_fov_deg_, ttc_corridor_half_;
+  double ay_max_;
   double curv_gain_speed_;
 
-  // 인코스 바이어스
-  bool   inner_bias_enable_{false};
-  double inner_bias_kappa_thresh_{0.04};
-  double inner_bias_offset_max_{0.35};
-  double inner_bias_gain_{1.5};
+  std::string center_path_topic_, left_path_topic_, right_path_topic_;
+  std::string odom_topic_, drive_topic_;
+  std::string center_path_csv_;
 
-  // 코너 인식
-  bool   corner_enable_{true};
-  double corner_side_deg_{45.0};
-  int    ransac_iters_{250};
-  double ransac_tol_{0.08};
-  int    min_inliers_{10};
-  double angle_thresh_deg_{12.0};
-  double intersect_max_dist_{10.0};
-  bool   circle_use_{false};
-  double circle_R_max_{6.0};
-  double ema_alpha_{0.35};
-  int    corner_on_cycles_{3};
-  int    corner_off_cycles_{5};
+  std::string scan_topic_;
+  std::string scan_frame_id_;
 
-  double corner_y_max_{3.5};
-  double corner_merge_radius_{0.35};
-  int    corner_max_lines_{8};
+  double obs_fov_deg_;
+  double obs_corridor_half_;
+  double obs_x_min_;
+  double obs_max_range_;
+  double obs_cluster_dist_;
+  int    obs_min_points_;
+  double obs_front_y_thresh_;
 
-  // 단일벽 폐색 파라미터
-  double occl_fov_deg_{60.0};
-  double occl_jump_abs_{0.6};
-  double occl_jump_ratio_{1.4};
+  double wall_inlier_thresh_;
+  int    wall_ransac_iters_;
+  int    wall_ransac_min_inliers_;
 
-  bool   corner_active_heavy_{false};
-  double corner_conf_{0.0};
-  int    corner_count_on_{0};
-  int    corner_count_off_{0};
+  double track_wall_margin_;
+  double track_center_max_dist_;
 
-  // 디버그 (코너)
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr      pub_corner_active_;
-  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr   pub_corner_conf_;
-  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr   pub_ttc_min_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_markers_;
-  bool        debug_markers_{true};
-  std::string debug_frame_{"base_link0"};
-  double      ttc_min_last_{1e9};
+  double obstacle_slow_dist_;
+  double obstacle_stop_dist_;
+  double obstacle_v_min_;
 
-  // 장애물 인식 파라미터
-  bool   obs_enable_{true};
-  double obs_fov_deg_{60.0};
-  double obs_corridor_half_{0.6};
-  double obs_x_min_{0.3};
-  double obs_max_range_{8.0};
-  double obs_cluster_dist_{0.35};
-  int    obs_min_points_{3};
-  double obs_front_y_thresh_{0.35};
-  
-    // FTG 파라미터
-  bool   ftg_enable_{true};
-  double ftg_fov_deg_{90.0};
-  double ftg_block_margin_deg_{5.0};
-  double ftg_min_gap_deg_{10.0};
-  double ftg_force_dist_{1.5};
+  bool   has_obstacle_{false};
+  double nearest_obstacle_dist_{std::numeric_limits<double>::infinity()};
+  double nearest_obstacle_dist_filt_{std::numeric_limits<double>::infinity()};
+  bool   has_obstacle_stable_{false};
 
+  std::vector<ObstacleCluster> clusters_;
 
-  // 군집 결과
-  std::vector<ObstacleCluster> obstacle_clusters_;
-  bool   obstacle_front_{false};
-  double obstacle_front_dist_{1e9};
-  double obstacle_front_y_{0.0};
+  // 회피용 FTG / PID / 스무딩
+  double steer_ftg_{0.0};
+  bool   has_ftg_target_{false};
 
-  // 장애물 디버그 퍼블리셔
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr      pub_obs_front_;
-  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr   pub_obs_dist_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_obs_markers_;
-  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr      pub_obs_single_marker_; // ★ 단일 마커
+  double k_p_avoid_{0.0}, k_i_avoid_{0.0}, k_d_avoid_{0.0};
+  double avoid_err_int_{0.0};
+  double avoid_err_prev_{0.0};
+
+  double steering_lpf_alpha_{1.0};
+  double max_steer_rate_{999.0};
+  double steer_prev_{0.0};
+
+  double steer_ftg_max_{0.7};
+
+  double v_ref_filt_{0.0};
+  bool   v_ref_init_{false};
+
+  std::mt19937 rng_;
 };
-
 
 int main(int argc, char **argv){
   rclcpp::init(argc, argv);
