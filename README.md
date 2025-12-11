@@ -55,6 +55,10 @@
 | `steer_lpf_alpha` | **0.6** | 조향값 스무딩 필터 계수 (0.0~1.0, 클수록 최신값 반영) |
 
 ---
+
+<img width="399" height="432" alt="스크린샷 2025-12-11 230157" src="https://github.com/user-attachments/assets/f251fd54-b70b-4fb8-964d-8fb496d3baf1" />
+
+---
 (old version)
 ## Modified Files
 주요 수정 파일 위치
@@ -80,4 +84,3 @@
 
 수정파일_race/src/pure_puresuit/config/pure_pursuit.yaml(namgyu) & race/src/pure_puresuit/src/pure_pursuit.cpp
 
-<img width="399" height="432" alt="스크린샷 2025-12-11 230157" src="https://github.com/user-attachments/assets/f251fd54-b70b-4fb8-964d-8fb496d3baf1" />
