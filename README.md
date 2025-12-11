@@ -1,8 +1,5 @@
 # Advanced Pure Pursuit & Obstacle Avoidance (Namgyu)
 
-이 노드는 F1Tenth 레이싱을 위한 **통합 주행 솔루션**입니다.
-기본적인 경로 추종(Pure Pursuit) 외에, **RANSAC 기반의 벽 필터링**과 **FTG(Follow The Gap) 알고리즘**을 결합하여 트랙 내 장애물을 능동적으로 회피합니다.
-
 ## Key Features
 
 1.  **Dynamic Pure Pursuit:**
